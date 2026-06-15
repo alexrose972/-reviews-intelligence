@@ -28,9 +28,9 @@ RUN playwright install chromium --with-deps
 
 # Frontend build
 COPY frontend/package*.json ./frontend/
-RUN cd frontend && npm install --omit=dev
+RUN cd frontend && npm install
 COPY frontend/ ./frontend/
-RUN cd frontend && npm run build
+RUN cd frontend && npm run build && rm -rf node_modules
 
 # Backend + data
 COPY backend/ ./backend/
