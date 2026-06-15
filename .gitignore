@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Env
+.env
+*.env
+
+# Frontend build (built inside Docker on Railway)
+frontend/node_modules/
+frontend/dist/
+
+# Generated files
+/pdfs/
+/screenshots/
+/data/
+
+# OS
+.DS_Store

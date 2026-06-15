@@ -1,0 +1,22 @@
+[
+  {"name": "Rainbow Shops",                    "domain": "rainbowshops.com",           "account_owner": "Rohil Lahe",      "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "J.Jill",                           "domain": "jjill.com",                  "account_owner": "Rohil Lahe",      "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Classicfootballshirts",            "domain": "classicfootballshirts.co.uk","account_owner": "Meghan McNally",  "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Paul Mitchell",                    "domain": "paulmitchell.com",            "account_owner": "Melissa Wilkins", "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Anastasia Beverly Hills",          "domain": "anastasiabeverlyhills.com",  "account_owner": "Jared Czitron",   "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Rituals",                          "domain": "rituals.com",                "account_owner": "Matthew Brindley","sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Boden",                            "domain": "boden.co.uk",                "account_owner": "Matthew Brindley","sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Nasty Gal",                        "domain": "nastygal.com",               "account_owner": "Meghan McNally",  "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Timberland",                       "domain": "timberland.com",             "account_owner": "Sydney Falchook", "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Cato Fashions",                    "domain": "catofashions.com",           "account_owner": "Jared Czitron",   "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Hunter Boots",                     "domain": "hunterboots.com",            "account_owner": "Sydney Falchook", "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Reef",                             "domain": "reef.com",                   "account_owner": "Melissa Wilkins", "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Rockport",                         "domain": "rockport.com",               "account_owner": "Melissa Wilkins", "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Dorothy Perkins",                  "domain": "dorothyperkins.com",         "account_owner": "Matthew Brindley","sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "YETI Coolers",                     "domain": "yeti.com",                   "account_owner": "Jared Czitron",   "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Vince",                            "domain": "vince.com",                  "account_owner": "Nurturing",       "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Lush",                             "domain": "lush.com",                   "account_owner": "Matthew Brindley","sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Icebreaker",                       "domain": "icebreaker.com",             "account_owner": "Sydney Falchook", "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "Bulk Apothecary",                  "domain": "bulkapothecary.com",         "account_owner": "Kevin Payoyo",    "sf_reviews_provider": null, "sf_loyalty_provider": null},
+  {"name": "The Tie Bar",                      "domain": "thetiebar.com",              "account_owner": "Kevin Payoyo",    "sf_reviews_provider": null, "sf_loyalty_provider": null}
+]

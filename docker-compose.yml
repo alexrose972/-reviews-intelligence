@@ -1,0 +1,41 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/reviews_intelligence
+      - PDF_DIR=/pdfs
+      - SCREENSHOTS_DIR=/screenshots
+    env_file:
+      - .env
+    volumes:
+      - pdfs:/pdfs
+      - screenshots:/screenshots
+      - ./backend:/app/backend   # hot reload in dev
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      uvicorn backend.main:app --host 0.0.0.0 --port 8080 --reload
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: reviews_intelligence
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pdfs:
+  screenshots:
+  pgdata:
