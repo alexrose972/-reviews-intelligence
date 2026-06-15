@@ -37,10 +37,10 @@ COPY backend/ ./backend/
 COPY sf_accounts.json .
 
 ENV PYTHONPATH=/app
-ENV PDF_DIR=/data/pdfs
-ENV SCREENSHOTS_DIR=/data/screenshots
+ENV PDF_DIR=/pdfs
+ENV SCREENSHOTS_DIR=/screenshots
 
-RUN mkdir -p /data/pdfs /data/screenshots
+RUN mkdir -p /pdfs /screenshots
 
 EXPOSE 8080
 
