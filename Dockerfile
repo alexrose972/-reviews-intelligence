@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # System dependencies for Playwright, WeasyPrint, fonts, and Node.js
 RUN apt-get update && apt-get install -y --no-install-recommends \
