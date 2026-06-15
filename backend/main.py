@@ -33,7 +33,7 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
     session_cookie="ri_session",
-    https_only=os.environ.get("NODE_ENV") == "production",
+    https_only=bool(os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("NODE_ENV") == "production"),
     same_site="lax",
     max_age=8 * 60 * 60,
 )

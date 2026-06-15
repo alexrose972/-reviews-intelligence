@@ -19,12 +19,21 @@ GOOGLE_USER_URL  = "https://www.googleapis.com/oauth2/v2/userinfo"
 ALLOWED_DOMAIN = "yotpo.com"
 
 
+def _redirect_uri() -> str:
+    if uri := os.environ.get("GOOGLE_REDIRECT_URI"):
+        return uri
+    # Auto-build from Railway's injected domain
+    if domain := os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+        return f"https://{domain}/auth/callback"
+    return "http://localhost:8080/auth/callback"
+
+
 def get_google_auth_url(request: Request) -> str:
     state = secrets.token_urlsafe(16)
     request.session["oauth_state"] = state
     params = {
         "client_id":     os.environ["GOOGLE_CLIENT_ID"],
-        "redirect_uri":  os.environ["GOOGLE_REDIRECT_URI"],
+        "redirect_uri":  _redirect_uri(),
         "response_type": "code",
         "scope":         "openid email profile",
         "access_type":   "online",
@@ -48,7 +57,7 @@ async def handle_oauth_callback(code: str, state: str, request: Request, db: Asy
                 "code":          code,
                 "client_id":     os.environ["GOOGLE_CLIENT_ID"],
                 "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
-                "redirect_uri":  os.environ["GOOGLE_REDIRECT_URI"],
+                "redirect_uri":  _redirect_uri(),
                 "grant_type":    "authorization_code",
             },
         )
