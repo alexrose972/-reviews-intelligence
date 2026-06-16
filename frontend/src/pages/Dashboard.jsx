@@ -18,6 +18,7 @@ export default function Dashboard() {
   const [recentScans, setRecentScans] = useState([])
   const [recentCheck, setRecentCheck] = useState(null)
   const [loadingRecent, setLoadingRecent] = useState(true)
+  const [chromeQueue, setChromeQueue] = useState(null)
   const inputRef = useRef()
   const dropdownRef = useRef()
 
@@ -36,6 +37,19 @@ export default function Dashboard() {
       .then(r => r.json())
       .then(data => { setRecentScans(data); setLoadingRecent(false) })
       .catch(() => setLoadingRecent(false))
+  }, [])
+
+  // Load Chrome queue (poll every 15s while panel is visible)
+  useEffect(() => {
+    function loadQueue() {
+      fetch('/api/chrome-queue', { credentials: 'include' })
+        .then(r => r.json())
+        .then(setChromeQueue)
+        .catch(() => {})
+    }
+    loadQueue()
+    const t = setInterval(loadQueue, 15000)
+    return () => clearInterval(t)
   }, [])
 
   // Filter SF accounts as user types
@@ -115,6 +129,11 @@ export default function Dashboard() {
           <h1 className="text-2xl font-bold text-gray-900">Reviews Intelligence</h1>
           <p className="text-gray-500 mt-1">Score brand review experiences. Generate briefs. Draft outreach.</p>
         </div>
+
+        {/* Chrome Queue panel — shows when there's activity */}
+        {chromeQueue && (chromeQueue.running || chromeQueue.queued?.length > 0 || chromeQueue.completed_today > 0) && (
+          <ChromeQueuePanel queue={chromeQueue} onNavigate={navigate} />
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* ── Scan a Brand ─────────────────────────────────────────── */}
@@ -259,6 +278,7 @@ export default function Dashboard() {
                         {firstName(scan.triggered_by)} · {daysAgo(scan.triggered_at)}
                       </div>
                     </div>
+                    <ScanModeBadge mode={scan.scan_mode} chromeStatus={scan.chrome_job_status} />
                     {scan.overall_score != null && (
                       <div className="flex items-center gap-1.5 flex-shrink-0">
                         <span className="text-sm font-bold text-gray-700 tabular-nums">
@@ -288,6 +308,67 @@ export default function Dashboard() {
       </main>
     </div>
   )
+}
+
+function ChromeQueuePanel({ queue, onNavigate }) {
+  return (
+    <div className="mb-6 p-4 rounded-xl border border-blue-200 bg-blue-50">
+      <div className="flex items-center gap-2 mb-3">
+        <span>🌐</span>
+        <span className="text-sm font-semibold text-blue-800">Chrome Browser Queue</span>
+        {queue.completed_today > 0 && (
+          <span className="ml-auto text-xs text-blue-600">{queue.completed_today} completed today</span>
+        )}
+      </div>
+      {queue.running && (
+        <div className="flex items-center gap-2 mb-2">
+          <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse flex-shrink-0" />
+          <span className="text-sm text-blue-700">
+            Running: <button
+              onClick={() => onNavigate(`/scan/${queue.running.scan_id}`)}
+              className="font-semibold underline hover:no-underline"
+            >
+              {queue.running.brand}
+            </button>
+            {queue.running.started_at && (
+              <span className="text-xs opacity-60 ml-1">
+                (started {Math.round((Date.now() - new Date(queue.running.started_at).getTime()) / 60000)} min ago)
+              </span>
+            )}
+          </span>
+        </div>
+      )}
+      {queue.queued?.length > 0 && (
+        <div className="text-sm text-blue-700">
+          Up next: {queue.queued.map(j => (
+            <button
+              key={j.scan_id}
+              onClick={() => onNavigate(`/scan/${j.scan_id}`)}
+              className="font-medium underline hover:no-underline mr-2"
+            >
+              {j.brand}
+            </button>
+          ))}
+        </div>
+      )}
+      {!queue.running && queue.queued?.length === 0 && (
+        <p className="text-sm text-blue-600">No active jobs — queue is idle.</p>
+      )}
+    </div>
+  )
+}
+
+function ScanModeBadge({ mode, chromeStatus }) {
+  if (chromeStatus === 'queued' || chromeStatus === 'running') {
+    return <span className="text-xs text-blue-500 font-medium flex-shrink-0">🌐 queued</span>
+  }
+  if (mode === 'chrome') {
+    return <span className="text-xs text-blue-500 font-medium flex-shrink-0">🌐</span>
+  }
+  if (mode === 'playwright' || !mode) {
+    return <span className="text-xs text-gray-300 flex-shrink-0">⚡</span>
+  }
+  return null
 }
 
 function StatusDot({ status }) {

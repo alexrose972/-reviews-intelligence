@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import logging
+import os
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urljoin
@@ -23,6 +24,7 @@ from .dimensions import (
 )
 from .pdf_generator import generate as generate_pdf
 from .slinger import build_context, generate_drafts
+from ..chrome_processor import queue_chrome_job
 
 log = logging.getLogger("scanner.engine")
 
@@ -111,6 +113,41 @@ def build_pitch_angles(
         )
 
     return angles[:3]
+
+
+def _should_fallback_to_chrome(
+    pdp_urls: list,
+    pdp_htmls: list,
+    scores: dict,
+    audit_log: list,
+) -> tuple:
+    """
+    Return (should_fallback: bool, reason: str).
+    Called after every Playwright scan to decide if Chrome is needed.
+    """
+    # No PDPs found at all
+    if not pdp_urls:
+        return True, "no_pdps_found"
+
+    # PDPs found but zero reviews extracted across all of them
+    total_review_texts = sum(
+        entry.get("review_texts_found", 0)
+        for entry in audit_log
+        if entry.get("step", "").startswith("pdp_review_audit_")
+    )
+    if len(pdp_urls) > 0 and total_review_texts == 0:
+        return True, "no_reviews_extracted"
+
+    # Suspiciously low scores across the board (likely bot detection)
+    # (LLM crawlability can legitimately be 0 — exclude it)
+    non_llm = [
+        k for k in scores
+        if k != "llm_crawlability" and scores[k].get("score", -1) == 0
+    ]
+    if len(non_llm) >= 5:
+        return True, "bot_detection_suspected"
+
+    return False, ""
 
 
 async def _broadcast(broadcast: Optional[BroadcastFn], scan_id: str, msg: dict):
@@ -554,6 +591,26 @@ async def run_scan(
         }
         await _broadcast(broadcast, scan_id, {"type": "complete", "result": full_result})
         log.info("Scan %s complete: %s/100 grade %s", scan_id, total, grade)
+
+        # ── Auto Chrome fallback ──────────────────────────────────────────────
+        if os.environ.get("CHROME_AUTO_FALLBACK", "true").lower() == "true":
+            fallback, reason = _should_fallback_to_chrome(pdp_urls, pdp_htmls, all_scores, audit_log)
+            if fallback:
+                log.info("Queuing Chrome fallback for %s: %s", brand_name, reason)
+                _log("chrome_fallback_queued", reason=reason)
+                # Save audit_log with fallback entry before queuing
+                async with AsyncSessionLocal() as db:
+                    run = await db.get(ScanRun, scan_id)
+                    if run:
+                        run.audit_log_json = audit_log
+                        await db.commit()
+                await queue_chrome_job(
+                    scan_id=scan_id,
+                    brand_name=brand_name,
+                    domain=domain,
+                    base_url=base_url,
+                    fallback_reason=reason,
+                )
 
     except Exception as e:
         log.exception("Scan %s failed: %s", scan_id, e)

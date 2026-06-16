@@ -21,9 +21,11 @@ from sqlalchemy import desc, select
 from starlette.middleware.sessions import SessionMiddleware
 
 from .auth import get_google_auth_url, handle_oauth_callback, require_auth
-from .database import AsyncSessionLocal, ScanRun, User, init_db
+from .database import AsyncSessionLocal, ChromeJob, ScanRun, User, init_db
 from .scanner.engine import run_scan
 from .sf_client import search_sf_accounts
+from .chrome_converter import ChromeAuditData, chrome_data_to_signals, score_from_chrome_data
+from .chrome_processor import chrome_job_processor, queue_chrome_job
 
 log = logging.getLogger("main")
 
@@ -77,6 +79,9 @@ ws_manager = WSManager()
 async def startup():
     await init_db()
     log.info("DB initialized.")
+    # Start Chrome job processor as background task
+    asyncio.create_task(chrome_job_processor())
+    log.info("Chrome job processor started.")
 
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
@@ -290,6 +295,318 @@ async def api_scan_logs(scan_id: str, user: dict = Depends(require_auth)):
         "status": run.status,
         "audit_log": run.audit_log_json or [],
     }
+
+
+@app.get("/api/scans/{scan_id}/chrome-status")
+async def api_chrome_status(scan_id: str, user: dict = Depends(require_auth)):
+    """Frontend polls this while Chrome is running."""
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ScanRun, scan_id)
+    if not run:
+        raise HTTPException(404, "Scan not found")
+    return {
+        "scan_id": scan_id,
+        "scan_mode": run.scan_mode,
+        "chrome_job_status": run.chrome_job_status,
+        "chrome_job_queued_at": run.chrome_job_queued_at.isoformat() if run.chrome_job_queued_at else None,
+        "chrome_job_started_at": run.chrome_job_started_at.isoformat() if run.chrome_job_started_at else None,
+        "chrome_job_completed_at": run.chrome_job_completed_at.isoformat() if run.chrome_job_completed_at else None,
+        "chrome_pdps_visited": run.chrome_pdps_visited or 0,
+        "chrome_error": run.chrome_error,
+        "scan_fallback_reason": run.scan_fallback_reason,
+        "overall_status": run.status,
+    }
+
+
+class ChromeFallbackRequest(BaseModel):
+    reason: str = "manual"
+
+
+@app.post("/api/scans/{scan_id}/chrome-fallback")
+async def api_chrome_fallback(
+    scan_id: str,
+    body: ChromeFallbackRequest,
+    user: dict = Depends(require_auth),
+):
+    """Manually trigger a Chrome fallback for any completed or failed scan."""
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ScanRun, scan_id)
+    if not run:
+        raise HTTPException(404, "Scan not found")
+
+    from .scanner.utils import domain_to_url
+    base_url = domain_to_url(run.domain)
+    job_id = await queue_chrome_job(
+        scan_id=scan_id,
+        brand_name=run.brand_name,
+        domain=run.domain,
+        base_url=base_url,
+        fallback_reason=body.reason,
+        priority=2,  # manual triggers get higher priority
+    )
+
+    # Count position in queue
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy import select, func
+        result = await db.execute(
+            select(func.count()).select_from(ChromeJob).where(ChromeJob.status == "queued")
+        )
+        position = result.scalar() or 1
+
+    return {"job_id": job_id, "position": int(position)}
+
+
+@app.get("/api/chrome-queue")
+async def api_chrome_queue(user: dict = Depends(require_auth)):
+    """Returns the current Chrome job queue status."""
+    from sqlalchemy import select, func
+    from datetime import date
+
+    async with AsyncSessionLocal() as db:
+        # Currently running
+        running_result = await db.execute(
+            select(ChromeJob).where(ChromeJob.status == "running").limit(1)
+        )
+        running_job = running_result.scalar_one_or_none()
+
+        # Queued jobs
+        queued_result = await db.execute(
+            select(ChromeJob)
+            .where(ChromeJob.status == "queued")
+            .order_by(ChromeJob.priority.desc(), ChromeJob.created_at.asc())
+        )
+        queued_jobs = queued_result.scalars().all()
+
+        # Completed today
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        completed_result = await db.execute(
+            select(func.count()).select_from(ChromeJob)
+            .where(ChromeJob.status == "complete", ChromeJob.completed_at >= today_start)
+        )
+        completed_today = completed_result.scalar() or 0
+
+    return {
+        "running": {
+            "scan_id": str(running_job.scan_id),
+            "brand": running_job.brand_name,
+            "started_at": running_job.started_at.isoformat() if running_job.started_at else None,
+        } if running_job else None,
+        "queued": [
+            {
+                "scan_id": str(j.scan_id),
+                "brand": j.brand_name,
+                "position": i + 1,
+                "queued_at": j.created_at.isoformat() if j.created_at else None,
+            }
+            for i, j in enumerate(queued_jobs)
+        ],
+        "completed_today": completed_today,
+    }
+
+
+@app.post("/api/browser-data/{scan_id}")
+async def receive_browser_data(
+    scan_id: str,
+    data: ChromeAuditData,
+    request: Request,
+):
+    """
+    Webhook endpoint: Claude in Chrome POSTs completed audit data here.
+    Validates secret, scores all dimensions, generates PDF and Slinger drafts,
+    saves everything to DB, notifies frontend via WebSocket.
+    """
+    # Validate webhook secret
+    secret = request.headers.get("X-Webhook-Secret", "")
+    expected = os.environ.get("BROWSER_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        log.warning("Webhook auth failure for scan %s (secret mismatch)", scan_id)
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ScanRun, scan_id)
+    if not run:
+        raise HTTPException(404, "Scan not found")
+
+    log.info("Received Chrome browser data for scan %s (%s)", scan_id, data.brand)
+
+    # Convert Chrome data → unified signals dict
+    signals = chrome_data_to_signals(data)
+
+    # Score all 9 dimensions
+    from .scanner.utils import SCORE_WEIGHTS
+    scores = score_from_chrome_data(data, signals)
+
+    total = round(sum(d["score"] for d in scores.values()), 1)
+    from .scanner.engine import compute_grade, build_pitch_angles, _should_fallback_to_chrome
+    grade = compute_grade(total)
+
+    # Build pitch angles
+    llm_probe = data.llm_probe
+    pitch_angles = build_pitch_angles(
+        brand_name=data.brand,
+        scores=scores,
+        detected_platform=data.homepage.detected_platform,
+        sf_platform=run.sf_platform,
+        platform_mismatch=bool(
+            run.sf_platform and data.homepage.detected_platform and
+            run.sf_platform.lower() != data.homepage.detected_platform.lower()
+        ),
+        llm_quote=llm_probe.quote_response,
+        llm_failed=not llm_probe.can_quote,
+        vertical=data.vertical_signals.detected_vertical,
+        vertical_play="",
+    )
+
+    # Build recommendations
+    from .scanner.utils import DIMENSION_LABELS, WHY_IT_MATTERS
+    recommendations = [
+        f"[{DIMENSION_LABELS.get(k, k)}] {v.get('finding', '')} — {WHY_IT_MATTERS.get(k, '')}"
+        for k, v in sorted(scores.items(), key=lambda x: x[1].get("score", 0) / max(x[1].get("max_score", 1), 1))[:5]
+    ]
+
+    # Save screenshots to disk from base64
+    from .scanner.browser import SS_BASE
+    import re as _re
+    safe_id = _re.sub(r"[^\w]", "_", scan_id)
+    ss_dir = SS_BASE / safe_id
+    ss_dir.mkdir(parents=True, exist_ok=True)
+    saved_screenshots = []
+    for label, b64_str in signals.get("screenshots_b64", {}).items():
+        if not b64_str:
+            continue
+        # Strip data URI prefix if present
+        if "base64," in b64_str:
+            b64_str = b64_str.split("base64,", 1)[1]
+        try:
+            import base64 as _b64
+            raw = _b64.b64decode(b64_str)
+            ss_path = ss_dir / f"{label}.png"
+            ss_path.write_bytes(raw)
+            saved_screenshots.append(str(ss_path))
+        except Exception as e:
+            log.warning("Screenshot save failed [%s]: %s", label, e)
+
+    # Generate PDF
+    from .scanner.pdf_generator import generate as gen_pdf, render_html
+    try:
+        pdf_path = await gen_pdf(
+            scan_id=scan_id,
+            brand_name=data.brand,
+            domain=run.domain,
+            account_owner=run.triggered_by or "",
+            overall_score=int(total),
+            grade=grade,
+            scores=scores,
+            pitch_angles=pitch_angles,
+            detected_platform=data.homepage.detected_platform,
+            sf_platform=run.sf_platform,
+            platform_mismatch=bool(
+                run.sf_platform and data.homepage.detected_platform and
+                run.sf_platform.lower() != data.homepage.detected_platform.lower()
+            ),
+            vertical=data.vertical_signals.detected_vertical,
+            page_speed_score=data.page_speed.score,
+            page_speed_lcp=f"{data.page_speed.lcp_ms}ms" if data.page_speed.lcp_ms else "",
+            screenshot_paths=saved_screenshots,
+            brand_logo_b64="",
+            scan_ts=data.audited_at or datetime.utcnow().isoformat(),
+        )
+    except Exception as e:
+        log.error("PDF generation failed for Chrome data %s: %s", scan_id, e)
+        pdf_path = None
+
+    # Generate Slinger drafts
+    from .scanner.slinger import build_context, generate_drafts
+    ctx = build_context(
+        brand_name=data.brand,
+        domain=run.domain,
+        overall_score=int(total),
+        grade=grade,
+        scores=scores,
+        pitch_angles=pitch_angles,
+        detected_platform=data.homepage.detected_platform,
+        sf_platform=run.sf_platform,
+        platform_mismatch=False,
+        vertical=data.vertical_signals.detected_vertical,
+        page_speed_score=data.page_speed.score,
+        llm_quote=llm_probe.quote_response,
+        llm_failed=not llm_probe.can_quote,
+    )
+    slinger = generate_drafts(data.brand, ctx, email_count=3)
+
+    # Persist everything to DB
+    now = datetime.utcnow()
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ScanRun, scan_id)
+        if run:
+            run.status = "complete"
+            run.scan_mode = "chrome"
+            run.overall_score = int(total)
+            run.grade = grade
+            run.scores_json = scores
+            run.signals_json = signals
+            run.recommendations_json = recommendations
+            run.pitch_angles_json = pitch_angles
+            run.detected_platform = data.homepage.detected_platform
+            run.platform_mismatch = bool(
+                run.sf_platform and data.homepage.detected_platform and
+                run.sf_platform.lower() != data.homepage.detected_platform.lower()
+            )
+            run.llm_probe_json = {
+                "review_quote": llm_probe.quote_response,
+                "complaint_quote": llm_probe.complaint_response,
+                "failed": not llm_probe.can_quote,
+            }
+            run.pdf_path = pdf_path
+            run.slinger_drafts_json = slinger
+            run.screenshots_json = saved_screenshots
+            run.chrome_raw_data = data.model_dump()
+            run.chrome_job_status = "complete"
+            run.chrome_job_completed_at = now
+            run.chrome_pdps_visited = len(data.pdps_visited)
+            # Append to existing audit_log
+            existing_log = run.audit_log_json or []
+            existing_log.append({
+                "step": "chrome_data_received",
+                "ts": now.isoformat(),
+                "pdps_visited": len(data.pdps_visited),
+                "reviews_found": len(signals.get("review_texts", [])),
+                "audit_notes": data.audit_notes,
+                "overall_score": int(total),
+                "grade": grade,
+            })
+            run.audit_log_json = existing_log
+            await db.commit()
+
+        # Mark the chrome_job as complete
+        from sqlalchemy import select
+        job_result = await db.execute(
+            select(ChromeJob).where(
+                ChromeJob.scan_id == scan_id,
+                ChromeJob.status == "running",
+            ).limit(1)
+        )
+        job = job_result.scalar_one_or_none()
+        if job:
+            job.status = "complete"
+            job.completed_at = now
+            job.result_data = {"overall_score": int(total), "grade": grade}
+            await db.commit()
+
+    # Notify frontend via WebSocket
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ScanRun, scan_id)
+    if run:
+        await ws_manager.broadcast(scan_id, {
+            "type": "complete",
+            "result": _serialize_run(run),
+        })
+
+    log.info(
+        "Chrome audit complete for %s: %d/100 grade %s (%d PDPs, %d reviews)",
+        data.brand, total, grade, len(data.pdps_visited), len(signals.get("review_texts", [])),
+    )
+    return {"status": "ok", "scan_id": scan_id, "score": int(total), "grade": grade}
 
 
 @app.get("/api/scans/{scan_id}/screenshot/{label}")
@@ -532,6 +849,10 @@ def _serialize_run(run: ScanRun) -> dict:
         "screenshots": _normalize_screenshots(run.screenshots_json),
         "error_message": run.error_message,
         "audit_log": run.audit_log_json or [],
+        "scan_mode": run.scan_mode or "playwright",
+        "chrome_job_status": run.chrome_job_status,
+        "scan_fallback_reason": run.scan_fallback_reason,
+        "chrome_pdps_visited": run.chrome_pdps_visited or 0,
     }
 
 

@@ -17,6 +17,8 @@ export default function ScanResults() {
   const [error, setError] = useState(null)
   const [expandedShot, setExpandedShot] = useState(null)
   const [rescanning, setRescanning] = useState(false)
+  const [chromeStatus, setChromeStatus] = useState(null)
+  const [triggeringChrome, setTriggeringChrome] = useState(false)
 
   const wsRef = useRef(null)
 
@@ -33,6 +35,51 @@ export default function ScanResults() {
       })
       .catch(() => setStatus('failed'))
   }, [id])
+
+  // Poll Chrome status while job is running/queued
+  useEffect(() => {
+    if (!scan) return
+    const mode = scan.scan_mode
+    const jobStatus = scan.chrome_job_status
+    if (!jobStatus || jobStatus === 'complete' || jobStatus === 'failed' || jobStatus === 'timeout') return
+
+    const poll = setInterval(() => {
+      fetch(`/api/scans/${id}/chrome-status`, { credentials: 'include' })
+        .then(r => r.json())
+        .then(d => {
+          setChromeStatus(d)
+          if (d.overall_status === 'complete') {
+            clearInterval(poll)
+            // Reload full scan
+            fetch(`/api/scans/${id}`, { credentials: 'include' })
+              .then(r => r.json())
+              .then(data => { setScan(data); setStatus('complete') })
+          }
+        })
+        .catch(() => {})
+    }, 5000)
+    return () => clearInterval(poll)
+  }, [id, scan?.chrome_job_status])
+
+  async function triggerChromeScan() {
+    setTriggeringChrome(true)
+    try {
+      const r = await fetch(`/api/scans/${id}/chrome-fallback`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'manual' }),
+      })
+      const d = await r.json()
+      // Reload scan to reflect new chrome_job_status
+      const updated = await fetch(`/api/scans/${id}`, { credentials: 'include' }).then(r => r.json())
+      setScan(updated)
+    } catch {
+      // ignore
+    } finally {
+      setTriggeringChrome(false)
+    }
+  }
 
   // WebSocket for live updates
   useEffect(() => {
@@ -129,6 +176,25 @@ export default function ScanResults() {
           )}
         </div>
 
+        {/* ── Chrome browser status banner ── */}
+        {scan?.chrome_job_status && scan.chrome_job_status !== 'complete' && (
+          <ChromeStatusBanner
+            jobStatus={scan.chrome_job_status}
+            brandName={scan.brand_name}
+            fallbackReason={scan.scan_fallback_reason}
+            chromeStatus={chromeStatus}
+          />
+        )}
+
+        {/* ── Low-confidence manual Chrome trigger ── */}
+        {status === 'complete' && scan && !scan.chrome_job_status && (
+          <LowConfidencePrompt
+            scan={scan}
+            onTrigger={triggerChromeScan}
+            triggering={triggeringChrome}
+          />
+        )}
+
         {/* ── Running state ── */}
         {(status === 'running' || (status === 'pending' && events.length === 0)) && (
           <div className="card p-6">
@@ -191,6 +257,10 @@ export default function ScanResults() {
                     {scan.triggered_at && (
                       <MetaChip label="Scanned" value={formatDate(scan.triggered_at)} />
                     )}
+                    <MetaChip
+                      label="Scan mode"
+                      value={scan.scan_mode === 'chrome' ? '🌐 Browser scan' : '⚡ Fast scan'}
+                    />
                   </div>
                 </div>
 
@@ -290,6 +360,80 @@ export default function ScanResults() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// ── Chrome status banner ───────────────────────────────────────────────────────
+
+function ChromeStatusBanner({ jobStatus, brandName, fallbackReason, chromeStatus }) {
+  const statusLabel = {
+    queued: 'Queued — waiting for Chrome runner',
+    running: 'Chrome is auditing in real-time…',
+    failed: 'Chrome scan failed',
+    timeout: 'Chrome scan timed out',
+  }[jobStatus] || jobStatus
+
+  const reasonLabel = {
+    no_pdps_found: 'Playwright found 0 product pages',
+    no_reviews_extracted: 'Playwright found 0 reviews',
+    bot_detection_suspected: 'Bot detection suspected',
+    manual: 'Manual trigger',
+  }[fallbackReason] || fallbackReason
+
+  const isActive = jobStatus === 'queued' || jobStatus === 'running'
+
+  return (
+    <div className={`mb-6 p-4 rounded-xl border ${isActive ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-lg">🌐</span>
+        <span className={`font-semibold text-sm ${isActive ? 'text-blue-800' : 'text-amber-800'}`}>
+          Browser Scan Mode
+        </span>
+        {isActive && (
+          <div className="w-3 h-3 rounded-full bg-blue-500 animate-pulse ml-1" />
+        )}
+      </div>
+      <p className={`text-sm ${isActive ? 'text-blue-700' : 'text-amber-700'}`}>
+        {statusLabel} — <span className="font-medium">{brandName}</span>
+        {reasonLabel && <span className="text-xs ml-2 opacity-70">(reason: {reasonLabel})</span>}
+      </p>
+      {chromeStatus?.chrome_pdps_visited > 0 && (
+        <p className="text-xs text-blue-600 mt-1">
+          {chromeStatus.chrome_pdps_visited} product pages visited
+        </p>
+      )}
+    </div>
+  )
+}
+
+// ── Low-confidence manual Chrome trigger ───────────────────────────────────────
+
+function LowConfidencePrompt({ scan, onTrigger, triggering }) {
+  const scores = scan.scores || {}
+  const zeroCount = Object.entries(scores).filter(
+    ([k, v]) => k !== 'llm_crawlability' && (v?.score ?? 1) === 0
+  ).length
+  const isLowConfidence = (scan.overall_score ?? 100) < 30 && zeroCount >= 3
+
+  if (!isLowConfidence) return null
+
+  return (
+    <div className="mb-6 p-4 rounded-xl border border-amber-200 bg-amber-50">
+      <p className="text-sm font-semibold text-amber-800 mb-1">
+        ⚠️ Bot detection may have blocked this scan
+      </p>
+      <p className="text-sm text-amber-700 mb-3">
+        Score of {scan.overall_score}/100 with {zeroCount} dimensions at zero suggests
+        the site blocked Playwright. Run a Browser Scan for accurate results?
+      </p>
+      <button
+        onClick={onTrigger}
+        disabled={triggering}
+        className="btn-primary text-sm py-1.5 px-4"
+      >
+        {triggering ? 'Queuing…' : '🌐 Run Browser Scan'}
+      </button>
     </div>
   )
 }
