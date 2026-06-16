@@ -50,6 +50,7 @@ class ScanRun(Base):
     slinger_drafts_json = Column(JSONB)
     screenshots_json = Column(JSONB)
     error_message = Column(Text)
+    audit_log_json = Column(JSONB)
 
 
 class User(Base):
@@ -72,3 +73,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Idempotent migration — add new columns without dropping anything
+        await conn.execute(text(
+            "ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS audit_log_json JSONB"
+        ))

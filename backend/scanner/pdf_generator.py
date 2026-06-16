@@ -304,25 +304,27 @@ table.dt td {{ padding: 3.5pt 6pt; vertical-align: top; }}
 </body></html>"""
 
 
-def generate(scan_id: str, **kwargs) -> Optional[str]:
-    """Render HTML → PDF via WeasyPrint. Falls back to .html if WeasyPrint fails."""
+async def generate(scan_id: str, **kwargs) -> Optional[str]:
+    """Render HTML → PDF via Playwright Chromium. Falls back to .html on error."""
+    from .browser import generate_pdf_bytes
+
     PDF_BASE.mkdir(parents=True, exist_ok=True)
     html_content = render_html(**kwargs)
     out_path = PDF_BASE / f"{scan_id}.pdf"
 
     try:
-        from weasyprint import HTML as WeasyHTML
-        logger.info("WeasyPrint: starting PDF generation for scan %s", scan_id)
-        WeasyHTML(string=html_content).write_pdf(str(out_path))
-        logger.info("WeasyPrint: PDF written to %s (%d bytes)", out_path, out_path.stat().st_size)
+        logger.info("Playwright PDF: starting for scan %s", scan_id)
+        pdf_bytes = await generate_pdf_bytes(html_content)
+        out_path.write_bytes(pdf_bytes)
+        logger.info("Playwright PDF: written to %s (%d bytes)", out_path, len(pdf_bytes))
         return str(out_path)
     except Exception as exc:
         logger.error(
-            "WeasyPrint FAILED for scan %s — %s: %s",
+            "Playwright PDF FAILED for scan %s — %s: %s",
             scan_id, type(exc).__name__, exc, exc_info=True,
         )
 
-    # Fallback: persist the HTML so the endpoint can retry WeasyPrint on-demand
+    # Fallback: persist the HTML so the endpoint can serve it inline
     html_path = PDF_BASE / f"{scan_id}.html"
     html_path.write_text(html_content, encoding="utf-8")
     logger.warning("Fell back to HTML for scan %s — saved %s", scan_id, html_path)

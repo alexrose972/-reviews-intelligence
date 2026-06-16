@@ -197,10 +197,11 @@ async def api_get_scan(scan_id: str, user: dict = Depends(require_auth)):
 
 @app.get("/api/scans/{scan_id}/pdf")
 async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
-    """Generate PDF in-memory from DB data — no volume/file dependency."""
+    """Serve PDF from disk if available, else regenerate via Playwright."""
     import re as _re
     from fastapi.responses import Response as FastAPIResponse
     from .scanner.pdf_generator import render_html
+    from .scanner.browser import generate_pdf_bytes
 
     async with AsyncSessionLocal() as db:
         run = await db.get(ScanRun, scan_id)
@@ -209,7 +210,21 @@ async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
     if run.status != "complete":
         raise HTTPException(404, "Scan not complete yet")
 
-    # Resolve screenshot paths from DB (may be strings or {label,path} dicts)
+    safe = _re.sub(r"[^\w]", "_", run.brand_name)
+    filename = f"{safe}_audit.pdf"
+
+    # Try to serve previously generated file
+    pdf_dir = Path(os.environ.get("PDF_DIR", "/pdfs"))
+    pdf_file = pdf_dir / f"{scan_id}.pdf"
+    if pdf_file.exists() and pdf_file.stat().st_size > 1000:
+        log.info("Serving cached PDF for scan %s (%d bytes)", scan_id, pdf_file.stat().st_size)
+        return FileResponse(
+            str(pdf_file),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Regenerate from DB data
     raw_screenshots = run.screenshots_json or []
     screenshot_paths = []
     for item in raw_screenshots:
@@ -237,27 +252,44 @@ async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
         scan_ts=run.triggered_at.isoformat() if run.triggered_at else "",
     )
 
-    safe = _re.sub(r"[^\w]", "_", run.brand_name)
-    filename = f"{safe}_audit.pdf"
-
     try:
-        from weasyprint import HTML as WeasyHTML
-        log.info("Generating PDF for scan %s", scan_id)
-        pdf_bytes = WeasyHTML(string=html).write_pdf()
+        log.info("Generating PDF via Playwright for scan %s", scan_id)
+        pdf_bytes = await generate_pdf_bytes(html)
         log.info("PDF generated: %d bytes for scan %s", len(pdf_bytes), scan_id)
+        # Cache to disk for next request
+        try:
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            pdf_file.write_bytes(pdf_bytes)
+        except Exception:
+            pass
         return FastAPIResponse(
             content=pdf_bytes,
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     except Exception as exc:
-        log.error("WeasyPrint failed for scan %s: %s", scan_id, exc, exc_info=True)
-        # Return the HTML so the user can File → Print → Save as PDF
+        log.error("Playwright PDF failed for scan %s: %s", scan_id, exc, exc_info=True)
+        # Fallback: return HTML so user can print → Save as PDF
         return FastAPIResponse(
             content=html,
             media_type="text/html; charset=utf-8",
             headers={"Content-Disposition": f'inline; filename="{filename}.html"'},
         )
+
+
+@app.get("/api/scans/{scan_id}/logs")
+async def api_scan_logs(scan_id: str, user: dict = Depends(require_auth)):
+    """Return the step-by-step audit log for a scan (for debugging)."""
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ScanRun, scan_id)
+    if not run:
+        raise HTTPException(404, "Scan not found")
+    return {
+        "scan_id": scan_id,
+        "brand_name": run.brand_name,
+        "status": run.status,
+        "audit_log": run.audit_log_json or [],
+    }
 
 
 @app.get("/api/scans/{scan_id}/screenshot/{label}")
@@ -499,6 +531,7 @@ def _serialize_run(run: ScanRun) -> dict:
         "slinger_drafts": run.slinger_drafts_json,
         "screenshots": _normalize_screenshots(run.screenshots_json),
         "error_message": run.error_message,
+        "audit_log": run.audit_log_json or [],
     }
 
 

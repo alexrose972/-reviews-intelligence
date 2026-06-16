@@ -3,7 +3,11 @@ Playwright-based page renderer for the Reviews Intelligence scanner.
 
 One PlaywrightAuditor instance per scan — use as an async context manager.
 It manages a single Chromium browser + context, navigates pages with full
-JS rendering, dismisses cookie banners, and takes targeted screenshots.
+JS rendering, dismisses popups, takes targeted screenshots, and extracts
+structured review data from PDPs.
+
+Module-level ``generate_pdf_bytes()`` is a standalone coroutine that opens
+its own short-lived browser to convert HTML → PDF bytes (replaces WeasyPrint).
 """
 
 import asyncio
@@ -11,7 +15,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 log = logging.getLogger("scanner.browser")
@@ -23,8 +27,27 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Common cookie-accept button selectors (ordered by specificity)
-COOKIE_SELECTORS = [
+# Browser launch args — anti-detection + sandbox bypass for containers
+_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-web-security",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-infobars",
+]
+
+# JS snippet injected into every page context to mask Playwright fingerprints
+_STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = { runtime: {} };
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+"""
+
+# Cookie / GDPR accept selectors (ordered by specificity)
+_COOKIE_SELECTORS = [
     "#onetrust-accept-btn-handler",
     "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
     "button[id*='accept'][id*='cookie' i]",
@@ -35,10 +58,14 @@ COOKIE_SELECTORS = [
     "button[aria-label*='accept all' i]",
     "button[aria-label*='agree' i]",
     "[class*='cookie'] button[class*='accept' i]",
+    "button[class*='consent-accept' i]",
+    "[class*='gdpr'] button[class*='accept' i]",
+    "button[id*='consent-accept' i]",
+    "[aria-label*='close' i][class*='modal' i]",
 ]
 
-# Selectors for the reviews widget / reviews section
-REVIEW_SECTION_SELECTORS = [
+# Review-section element selectors
+_REVIEW_SELECTORS = [
     ".yotpo-main-widget",
     ".bv-content-list",
     ".bv-section-summary",
@@ -57,20 +84,116 @@ REVIEW_SECTION_SELECTORS = [
     "[class*='loox-reviews' i]",
 ]
 
-# Pattern matching shop/collection pages (not PDPs)
+# "Load more" button selectors for reviews
+_LOAD_MORE_SELECTORS = [
+    "button[class*='load-more' i]",
+    "button[class*='show-more' i]",
+    "a[class*='load-more' i]",
+    "[data-testid*='load-more' i]",
+    "[class*='see-all-reviews' i]",
+    "button[class*='more-reviews' i]",
+    "[class*='reviews-load-more' i]",
+]
+
 SHOP_PATH_RE = re.compile(
     r"/(collections?|shop|catalog|category|categories|store|all-products|products/?$)",
     re.I,
 )
 
-# Pattern matching individual product pages
 PDP_PATH_RE = re.compile(
     r"/(products?|item|items?|p|pd|detail|buy)/[^/?#\s\"']+",
     re.I,
 )
 
-# Keywords that indicate a good collection page to audit
-BESTELLER_KEYWORDS = ["best-seller", "bestseller", "best_seller", "top-rated", "top_rated", "featured"]
+BESTSELLER_KEYWORDS = [
+    "best-seller", "bestseller", "best_seller",
+    "top-rated", "top_rated", "featured",
+]
+
+# ── JS snippet for structured review extraction ────────────────────────────────
+
+_REVIEW_EXTRACT_JS = """
+() => {
+    const data = {
+        review_count: null,
+        review_texts: [],
+        star_ratings: [],
+        dates: [],
+        has_photos: false,
+        has_videos: false,
+        has_ai_summary: false,
+    };
+
+    // --- Review count ---
+    const countSels = [
+        '[class*="review-count" i]', '[class*="reviewCount" i]',
+        '[itemprop="reviewCount"]', '[class*="total-reviews" i]',
+        '[class*="rating-count" i]', '[class*="bv-rating-count" i]',
+        '[class*="reviews-total" i]', '[class*="numReviews" i]',
+    ];
+    for (const sel of countSels) {
+        const el = document.querySelector(sel);
+        if (el) {
+            const m = (el.textContent || '').match(/([\\d,]+)/);
+            if (m) { data.review_count = parseInt(m[1].replace(/,/g, '')); break; }
+        }
+    }
+    // Fallback: first "NNN reviews/ratings" in visible text
+    if (data.review_count === null) {
+        const m = (document.body.innerText || '').match(/(\\d[\\d,]*)\\s*(?:reviews?|ratings?)/i);
+        if (m) data.review_count = parseInt(m[1].replace(/,/g, ''));
+    }
+
+    // --- Review text snippets ---
+    const textSels = [
+        '[itemprop="reviewBody"]', '[class*="review-content" i]',
+        '[class*="review-text" i]', '[class*="review-body" i]',
+        '.bv-content-summary-body-text', '.pr-rd-description-text',
+        '[class*="yotpo-review-content" i]', '[class*="review-description" i]',
+    ];
+    for (const sel of textSels) {
+        const els = document.querySelectorAll(sel);
+        for (const el of els) {
+            const text = (el.textContent || '').trim();
+            if (text.length > 20) data.review_texts.push(text.slice(0, 300));
+            if (data.review_texts.length >= 5) break;
+        }
+        if (data.review_texts.length >= 5) break;
+    }
+
+    // --- Star / rating values ---
+    const starSels = [
+        '[itemprop="ratingValue"]', '[class*="avg-score" i]',
+        '[class*="average-rating" i]', '[class*="star-rating" i]',
+    ];
+    for (const sel of starSels) {
+        const el = document.querySelector(sel);
+        if (el) {
+            const v = el.getAttribute('content') || (el.textContent || '').trim();
+            if (v) { data.star_ratings.push(v.slice(0, 10)); }
+        }
+    }
+
+    // --- Dates ---
+    const dateEls = document.querySelectorAll('[itemprop="datePublished"], [class*="review-date" i], [class*="review-time" i]');
+    for (const el of dateEls) {
+        const v = el.getAttribute('content') || (el.textContent || '').trim();
+        if (v) data.dates.push(v.slice(0, 30));
+        if (data.dates.length >= 5) break;
+    }
+
+    // --- Media flags ---
+    data.has_photos = !!(document.querySelector(
+        '[class*="review-photo" i], [class*="review-image" i], [class*="ugc-photo" i], [class*="review-media" i]'
+    ));
+    data.has_videos = !!(document.querySelector('[class*="review-video" i]'));
+    data.has_ai_summary = !!(document.querySelector(
+        '[class*="ai-summary" i], [class*="review-summary" i], [class*="ai-insights" i]'
+    ));
+
+    return data;
+}
+"""
 
 
 class PlaywrightAuditor:
@@ -84,11 +207,19 @@ class PlaywrightAuditor:
     async def __aenter__(self):
         from playwright.async_api import async_playwright
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(headless=True)
-        self._ctx = await self._browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=UA,
+        self._browser = await self._pw.chromium.launch(
+            headless=True,
+            args=_LAUNCH_ARGS,
         )
+        self._ctx = await self._browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=UA,
+            bypass_csp=True,
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        # Mask Playwright fingerprints on every page before any JS runs
+        await self._ctx.add_init_script(_STEALTH_SCRIPT)
         self._ctx.set_default_timeout(25_000)
         return self
 
@@ -111,52 +242,89 @@ class PlaywrightAuditor:
 
     async def _dismiss_popups(self, page):
         """Click cookie/GDPR accept buttons if present."""
-        for sel in COOKIE_SELECTORS:
+        for sel in _COOKIE_SELECTORS:
             try:
                 btn = page.locator(sel).first
                 if await btn.is_visible(timeout=800):
                     await btn.click(timeout=1500)
-                    await page.wait_for_timeout(400)
+                    await page.wait_for_timeout(500)
                     break
             except Exception:
                 pass
-        # Escape any remaining modal
         try:
             await page.keyboard.press("Escape")
         except Exception:
             pass
 
     async def _wait_idle(self, page, timeout_ms: int = 7000):
-        """Best-effort wait for network idle — never raises."""
         try:
             await page.wait_for_load_state("networkidle", timeout=timeout_ms)
         except Exception:
             pass
 
+    async def _deep_scroll(self, page):
+        """
+        Incrementally scroll the full page in 300px steps to trigger lazy loaders,
+        wait for review widgets to appear, then try clicking 'Load More'.
+        """
+        try:
+            total_h = await page.evaluate("() => document.body.scrollHeight")
+            y = 0
+            while y < total_h:
+                await page.evaluate(f"() => window.scrollTo(0, {y})")
+                await page.wait_for_timeout(120)
+                y += 300
+                # Re-measure in case new content was injected
+                if y > total_h:
+                    total_h = await page.evaluate("() => document.body.scrollHeight")
+        except Exception as e:
+            log.debug("_deep_scroll scroll error: %s", e)
+
+        # Wait for lazy-loaded review widgets to fully render
+        await page.wait_for_timeout(4000)
+
+        # Attempt "Load More Reviews" click
+        for sel in _LOAD_MORE_SELECTORS:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=600):
+                    await btn.click(timeout=1500)
+                    await page.wait_for_timeout(2000)
+                    log.debug("Clicked load-more: %s", sel)
+                    break
+            except Exception:
+                pass
+
     async def _scroll_to_reviews(self, page) -> bool:
-        """Try to scroll to the review section. Returns True if found."""
-        for sel in REVIEW_SECTION_SELECTORS:
+        """Scroll to review section element if visible. Returns True if found."""
+        for sel in _REVIEW_SELECTORS:
             try:
                 el = page.locator(sel).first
-                if await el.is_visible(timeout=800):
+                if await el.is_visible(timeout=700):
                     await el.scroll_into_view_if_needed()
                     return True
             except Exception:
                 pass
-        # Fallback: scroll 60% down
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.6)")
         except Exception:
             pass
         return False
 
+    async def _extract_reviews(self, page) -> dict:
+        """Run JS extraction of review data from the current page DOM."""
+        try:
+            return await page.evaluate(_REVIEW_EXTRACT_JS)
+        except Exception as e:
+            log.debug("_extract_reviews failed: %s", e)
+            return {"review_count": None, "review_texts": [], "star_ratings": [],
+                    "dates": [], "has_photos": False, "has_videos": False,
+                    "has_ai_summary": False}
+
     # ── Public methods ──────────────────────────────────────────────────────
 
     async def get_html(self, url: str, wait_for_reviews: bool = False) -> Optional[str]:
-        """
-        Navigate to URL, wait for JS render, optionally scroll to reviews.
-        Returns full DOM HTML (after JS execution).
-        """
+        """Navigate → JS render → optionally scroll to reviews. Returns full DOM HTML."""
         page = await self._page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
@@ -165,9 +333,8 @@ class PlaywrightAuditor:
 
             if wait_for_reviews:
                 found = await self._scroll_to_reviews(page)
-                await page.wait_for_timeout(2500)  # let lazy-loaded reviews appear
+                await page.wait_for_timeout(2500)
                 if not found:
-                    # Try again — some platforms load the widget after networkidle
                     await self._scroll_to_reviews(page)
                     await page.wait_for_timeout(1500)
             else:
@@ -184,18 +351,55 @@ class PlaywrightAuditor:
             except Exception:
                 pass
 
+    async def get_pdp_with_reviews(self, url: str) -> Tuple[Optional[str], dict]:
+        """
+        Navigate to a PDP, do a full deep scroll to trigger review lazy-loaders,
+        extract structured review data via JS, and return (html, review_audit).
+
+        review_audit keys: review_count, review_texts, star_ratings, dates,
+                           has_photos, has_videos, has_ai_summary
+        """
+        page = await self._page()
+        review_data: dict = {}
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=28_000)
+            await self._dismiss_popups(page)
+            await self._wait_idle(page, 7000)
+
+            # Deep scroll to load all lazy review widgets
+            await self._deep_scroll(page)
+
+            html = await page.content()
+            review_data = await self._extract_reviews(page)
+            log.info(
+                "PDP reviews extracted [%s]: count=%s texts=%d",
+                url, review_data.get("review_count"), len(review_data.get("review_texts", [])),
+            )
+            return html, review_data
+        except Exception as e:
+            log.warning("get_pdp_with_reviews failed [%s]: %s", url, e)
+            return None, review_data
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
     async def find_pdp_urls(self, base_url: str) -> List[str]:
         """
-        Navigate the site like a human to find real product pages.
-        Returns up to 5 PDP URLs.
+        Discover up to 5 real product-detail-page URLs using three strategies:
+          1. Harvest PDP links directly from the homepage
+          2. Visit top-priority collection / shop pages found on homepage
+          3. Fallback: probe well-known collection paths (/collections/best-sellers, etc.)
+        Returns a list of absolute PDP URLs.
         """
         seen: set = set()
         pdp_urls: List[str] = []
         base_host = urlparse(base_url).netloc
 
-        def _is_same_host(href: str) -> bool:
-            parsed = urlparse(href)
-            return parsed.netloc == base_host or not parsed.netloc
+        def _same_host(href: str) -> bool:
+            p = urlparse(href)
+            return p.netloc == base_host or not p.netloc
 
         def _is_pdp(href: str) -> bool:
             return bool(PDP_PATH_RE.search(href))
@@ -203,7 +407,7 @@ class PlaywrightAuditor:
         def _is_shop(href: str) -> bool:
             return bool(SHOP_PATH_RE.search(href))
 
-        # Step 1 — load homepage, harvest all links
+        # ── Strategy 1: harvest from homepage ──────────────────────────────
         page = await self._page()
         all_links: List[dict] = []
         try:
@@ -216,6 +420,7 @@ class PlaywrightAuditor:
                     text: (a.innerText || a.textContent || '').trim().toLowerCase()
                 }))
             """)
+            log.info("Homepage [%s]: harvested %d links", base_url, len(all_links))
         except Exception as e:
             log.warning("Homepage load failed [%s]: %s", base_url, e)
         finally:
@@ -224,25 +429,25 @@ class PlaywrightAuditor:
             except Exception:
                 pass
 
-        # Partition links found on homepage
         shop_candidates: List[Tuple[int, str]] = []
         for link in all_links:
             href = link.get("href", "")
             text = link.get("text", "")
-            if not href or not _is_same_host(href):
+            if not href or not _same_host(href):
                 continue
             if _is_pdp(href) and href not in seen:
                 seen.add(href)
                 pdp_urls.append(href)
             elif _is_shop(href) and href not in seen:
                 seen.add(href)
-                # Prioritise best-sellers / shop-all pages
-                priority = 0 if any(kw in href.lower() or kw in text for kw in BESTELLER_KEYWORDS) else 1
+                priority = 0 if any(
+                    kw in href.lower() or kw in text for kw in BESTSELLER_KEYWORDS
+                ) else 1
                 shop_candidates.append((priority, href))
 
         shop_candidates.sort(key=lambda x: x[0])
 
-        # Step 2 — visit top shop/collection pages to harvest more PDPs
+        # ── Strategy 2: visit top collection pages ─────────────────────────
         for _, shop_url in shop_candidates[:4]:
             if len(pdp_urls) >= 5:
                 break
@@ -251,32 +456,32 @@ class PlaywrightAuditor:
                 await page.goto(shop_url, wait_until="domcontentloaded", timeout=18_000)
                 await self._dismiss_popups(page)
                 await self._wait_idle(page, 5000)
-                # Scroll to load lazy product cards
                 await page.evaluate("window.scrollBy(0, 1200)")
                 await page.wait_for_timeout(600)
-                links = await page.evaluate("""() =>
-                    Array.from(document.querySelectorAll('a[href]')).map(a => a.href)
-                """)
+                links = await page.evaluate(
+                    "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)"
+                )
                 for href in links:
-                    if _is_pdp(href) and _is_same_host(href) and href not in seen:
+                    if _is_pdp(href) and _same_host(href) and href not in seen:
                         seen.add(href)
                         pdp_urls.append(href)
                     if len(pdp_urls) >= 5:
                         break
             except Exception as e:
-                log.warning("Shop page load failed [%s]: %s", shop_url, e)
+                log.warning("Collection page failed [%s]: %s", shop_url, e)
             finally:
                 try:
                     await page.close()
                 except Exception:
                     pass
 
-        # Step 3 — Fallback: try well-known collection paths
+        # ── Strategy 3: probe well-known paths ─────────────────────────────
         if len(pdp_urls) < 3:
-            for path in [
+            fallback_paths = [
                 "/collections/best-sellers", "/collections/bestsellers",
                 "/collections/all", "/shop", "/products",
-            ]:
+            ]
+            for path in fallback_paths:
                 if len(pdp_urls) >= 5:
                     break
                 fallback_url = urljoin(base_url, path)
@@ -286,15 +491,16 @@ class PlaywrightAuditor:
                 try:
                     await page.goto(fallback_url, wait_until="domcontentloaded", timeout=15_000)
                     await self._wait_idle(page, 5000)
-                    links = await page.evaluate("""() =>
-                        Array.from(document.querySelectorAll('a[href]')).map(a => a.href)
-                    """)
+                    links = await page.evaluate(
+                        "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)"
+                    )
                     for href in links:
-                        if _is_pdp(href) and _is_same_host(href) and href not in seen:
+                        if _is_pdp(href) and _same_host(href) and href not in seen:
                             seen.add(href)
                             pdp_urls.append(href)
                         if len(pdp_urls) >= 5:
                             break
+                    log.info("Fallback path [%s]: found %d PDPs total", path, len(pdp_urls))
                 except Exception:
                     pass
                 finally:
@@ -303,7 +509,7 @@ class PlaywrightAuditor:
                     except Exception:
                         pass
 
-        log.info("Found %d PDP URLs for %s", len(pdp_urls), base_url)
+        log.info("PDP discovery for %s: found %d URLs → %s", base_url, len(pdp_urls), pdp_urls[:5])
         return pdp_urls[:5]
 
     async def find_category_url(self, base_url: str) -> Optional[str]:
@@ -342,10 +548,10 @@ class PlaywrightAuditor:
         pdp_urls: List[str],
     ) -> List[str]:
         """
-        Take 3 targeted screenshots:
-          1. pdp_reviews  — the reviews section on the best PDP
-          2. category_stars — a category page (shows/hides stars)
-          3. pdp_above_fold — a PDP before any scrolling (above the fold)
+        Take 3 targeted screenshots and return list of saved file paths:
+          1. pdp_reviews       — reviews section on the best PDP
+          2. category_stars    — a category/collection page
+          3. pdp_above_fold    — a PDP before any scrolling (above the fold)
         """
         safe = re.sub(r"[^\w]", "_", scan_id)
         out_dir = SS_BASE / safe
@@ -365,7 +571,7 @@ class PlaywrightAuditor:
                 log.info("Screenshot saved: %s", path)
                 return str(path)
             except Exception as e:
-                log.warning("Screenshot '%s' failed: %s", label, e)
+                log.warning("Screenshot '%s' failed [%s]: %s", label, url, e)
                 return None
             finally:
                 try:
@@ -384,7 +590,7 @@ class PlaywrightAuditor:
         if p:
             saved.append(p)
 
-        # 2. Category page (checking for stars on product cards)
+        # 2. Category page
         cat_url = await self.find_category_url(base_url) or urljoin(base_url, "/collections/all")
 
         async def _prep_cat(page):
@@ -394,7 +600,7 @@ class PlaywrightAuditor:
         if p:
             saved.append(p)
 
-        # 3. PDP above the fold (no scrolling)
+        # 3. PDP above the fold (second PDP if available)
         atf_pdp = pdp_urls[1] if len(pdp_urls) > 1 else best_pdp
 
         async def _prep_atf(page):
@@ -405,3 +611,28 @@ class PlaywrightAuditor:
             saved.append(p)
 
         return saved
+
+
+# ── Standalone PDF helper (no WeasyPrint) ─────────────────────────────────────
+
+async def generate_pdf_bytes(html_content: str) -> bytes:
+    """
+    Render HTML → PDF bytes using a fresh Playwright Chromium instance.
+    CSS ``@page`` rules (size, margins) are respected by the browser engine.
+    """
+    from playwright.async_api import async_playwright
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        try:
+            page = await browser.new_page()
+            await page.set_content(html_content, wait_until="networkidle")
+            pdf_bytes = await page.pdf(
+                format="Letter",
+                print_background=True,
+            )
+            return pdf_bytes
+        finally:
+            await browser.close()

@@ -1,19 +1,15 @@
 FROM python:3.11-slim-bookworm
 
-# System dependencies for Playwright, WeasyPrint, fonts, and Node.js
+# System dependencies for Playwright, fonts, and Node.js (WeasyPrint removed)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # WeasyPrint deps (pango, cairo, harfbuzz, fontconfig must all be present)
-    libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
-    libcairo2 libcairo-gobject2 libgdk-pixbuf-2.0-0 libffi-dev \
-    libharfbuzz0b libfreetype6 libfontconfig1 shared-mime-info \
-    # Playwright deps
+    # Playwright / Chromium deps
     libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libasound2 libxshmfence1 \
-    # Fonts
+    # Fonts (needed for PDF text rendering in Chromium)
     fonts-liberation fonts-noto fontconfig \
-    # Build tools
-    gcc curl \
+    # Build tools / Node setup
+    curl \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*

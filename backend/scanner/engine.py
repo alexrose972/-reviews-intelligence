@@ -29,6 +29,10 @@ log = logging.getLogger("scanner.engine")
 BroadcastFn = Callable[[str, Dict[str, Any]], None]
 
 
+def _ts() -> str:
+    return datetime.utcnow().isoformat()
+
+
 def compute_grade(score: float) -> str:
     if score >= 80: return "A"
     if score >= 60: return "B"
@@ -142,6 +146,7 @@ async def run_scan(
             result.status = "running"
             await db.commit()
 
+    audit_log: List[dict] = []
     all_scores: Dict[str, dict] = {}
     llm_review_quote = ""
     llm_complaint_quote = ""
@@ -153,21 +158,58 @@ async def run_scan(
     page_speed_lcp = ""
     brand_logo_b64 = ""
     screenshots: List[str] = []
+    pdp_urls: List[str] = []
+    pdp_htmls: List[str] = []
+
+    def _log(step: str, **kwargs):
+        audit_log.append({"step": step, "ts": _ts(), **kwargs})
+
+    async def safe_run(step: str, coro, default=None):
+        """Await a coroutine; on exception log to audit_log and return default."""
+        _log(step, status="started")
+        try:
+            result = await coro
+            audit_log[-1]["status"] = "ok"
+            return result
+        except Exception as exc:
+            audit_log[-1]["status"] = "error"
+            audit_log[-1]["error"] = f"{type(exc).__name__}: {exc}"
+            log.warning("safe_run[%s] failed: %s", step, exc)
+            return default
+
+    def run_dim(step: str, fn, *args, **kwargs):
+        """Call a synchronous dimension function; log result to audit_log."""
+        _log(step, status="started")
+        try:
+            result = fn(*args, **kwargs)
+            audit_log[-1]["status"] = "ok"
+            audit_log[-1]["score"] = result.get("score")
+            audit_log[-1]["finding"] = (result.get("finding") or "")[:300]
+            return result
+        except Exception as exc:
+            audit_log[-1]["status"] = "error"
+            audit_log[-1]["error"] = f"{type(exc).__name__}: {exc}"
+            log.warning("run_dim[%s] failed: %s", step, exc)
+            max_s = SCORE_WEIGHTS.get(step, 10)
+            return {"score": 0, "max_score": max_s, "finding": f"Scoring error: {exc}"}
 
     try:
         async with PlaywrightAuditor() as auditor:
 
-            # ── Phase 1: Find real PDP URLs by navigating the site ────────
+            # ── Phase 1: PDP Discovery ────────────────────────────────────────
             await emit("fetch", "running", message=f"Navigating {domain} to find product pages...")
-            pdp_urls = await auditor.find_pdp_urls(base_url)
+            pdp_urls = await safe_run("pdp_discovery", auditor.find_pdp_urls(base_url)) or []
+            _log("pdp_discovery_result", urls_found=len(pdp_urls), urls=pdp_urls)
+            log.info("PDP discovery: %d URLs found for %s", len(pdp_urls), base_url)
 
-            # ── Phase 2: Render homepage (JS-executed) ────────────────────
+            # ── Phase 2: Homepage ─────────────────────────────────────────────
             await emit("fetch", "running", message="Rendering homepage...")
-            homepage_html = await auditor.get_html(base_url) or ""
+            homepage_html = await safe_run("homepage", auditor.get_html(base_url)) or ""
             if not homepage_html:
                 raise RuntimeError(f"Could not render {base_url}")
 
             detected_platform = detect_platform(homepage_html)
+            _log("homepage_rendered", html_len=len(homepage_html), platform=detected_platform)
             await emit("fetch", "complete",
                        message=f"Found {len(pdp_urls)} product pages.",
                        platform=detected_platform)
@@ -197,37 +239,64 @@ async def run_scan(
             except Exception:
                 pass
 
-            # ── Phase 3: Render each PDP with full JS + scroll to reviews ─
+            # ── Phase 3: PDPs with deep review extraction ─────────────────────
             await emit("review_richness", "running",
-                       message=f"Rendering {len(pdp_urls)} product pages (JS + review scroll)...")
-            pdp_htmls: List[str] = []
+                       message=f"Rendering {len(pdp_urls)} product pages (deep scroll + review extraction)...")
             for i, url in enumerate(pdp_urls[:5]):
                 log.info("Rendering PDP %d/%d: %s", i + 1, len(pdp_urls), url)
-                html = await auditor.get_html(url, wait_for_reviews=True)
+                html, review_data = await safe_run(
+                    f"pdp_render_{i+1}",
+                    auditor.get_pdp_with_reviews(url),
+                    default=(None, {}),
+                )
                 if html:
                     pdp_htmls.append(html)
+                _log(f"pdp_review_audit_{i+1}",
+                     url=url,
+                     html_len=len(html) if html else 0,
+                     review_count=review_data.get("review_count"),
+                     review_texts_found=len(review_data.get("review_texts", [])),
+                     star_ratings=review_data.get("star_ratings", [])[:3],
+                     has_photos=review_data.get("has_photos"),
+                     has_videos=review_data.get("has_videos"),
+                     has_ai_summary=review_data.get("has_ai_summary"),
+                     sample_dates=review_data.get("dates", [])[:3],
+                )
 
             if not pdp_htmls:
-                log.warning("No PDPs rendered — falling back to homepage")
+                log.warning("No PDPs rendered — falling back to homepage for PDP dimensions")
+                _log("pdp_fallback", reason="no_pdps_rendered")
                 pdp_htmls = [homepage_html]
 
-            # ── Phase 4: Render category page ─────────────────────────────
-            await emit("stars_on_category", "running", message="Rendering category page...")
-            cat_url, cat_html = await auditor.get_category_html(base_url)
+            _log("pdp_phase_complete", pdps_rendered=len(pdp_htmls))
 
-            # ── Phase 5: Try to render a /reviews page for visibility check ─
+            # ── Phase 4: Category page ────────────────────────────────────────
+            await emit("stars_on_category", "running", message="Rendering category page...")
+            cat_url, cat_html = await safe_run(
+                "category_page", auditor.get_category_html(base_url), default=(None, None)
+            )
+            _log("category_page_result", url=cat_url, html_len=len(cat_html) if cat_html else 0)
+
+            # ── Phase 5: Reviews/testimonials page ────────────────────────────
             reviews_page_html: Optional[str] = None
             for path in ["/reviews", "/testimonials", "/customer-reviews"]:
-                html = await auditor.get_html(urljoin(base_url, path))
+                html = await safe_run(
+                    f"reviews_page_{path}", auditor.get_html(urljoin(base_url, path))
+                )
                 if html and len(html) > 2000:
                     reviews_page_html = html
+                    _log("reviews_page_found", path=path, html_len=len(html))
                     break
 
-            # ── Dimension 1: LLM Crawlability ─────────────────────────────
+            # ── Dimension 1: LLM Crawlability ─────────────────────────────────
             await emit("llm_crawlability", "running", message="Probing LLM crawlability...")
-            # Use first PDP for schema check (JS-rendered)
-            llm_result = await llm_crawlability.score(
-                base_url, pdp_htmls[0] if pdp_htmls else homepage_html, skip_llm
+            llm_result = await safe_run(
+                "dim_llm_crawlability",
+                llm_crawlability.score(
+                    base_url, pdp_htmls[0] if pdp_htmls else homepage_html, skip_llm
+                ),
+                default={"score": 0, "max_score": SCORE_WEIGHTS["llm_crawlability"],
+                         "finding": "LLM check failed.", "failed": True},
             )
             all_scores["llm_crawlability"] = {
                 "score": llm_result["score"],
@@ -241,36 +310,42 @@ async def run_scan(
                        score=llm_result["score"], max_score=llm_result["max_score"],
                        finding=llm_result["finding"])
 
-            # ── Dimension 2: Review Richness ──────────────────────────────
+            # ── Dimension 2: Review Richness ───────────────────────────────────
             await emit("review_richness", "running", message="Analyzing review quality...")
-            rr = review_richness.score(pdp_htmls)
+            rr = run_dim("dim_review_richness", review_richness.score, pdp_htmls)
             all_scores["review_richness"] = rr
             await emit("review_richness", "complete", **rr)
 
-            # ── Dimension 3: Review Recency ───────────────────────────────
+            # ── Dimension 3: Review Recency ────────────────────────────────────
             await emit("review_recency", "running", message="Checking review dates...")
-            rc = review_recency.score(pdp_htmls)
+            rc = run_dim("dim_review_recency", review_recency.score, pdp_htmls)
             all_scores["review_recency"] = rc
             await emit("review_recency", "complete", **rc)
 
-            # ── Dimension 4: Visibility ───────────────────────────────────
+            # ── Dimension 4: Visibility ────────────────────────────────────────
             await emit("visibility", "running", message="Checking review discoverability...")
-            vis = visibility.score(homepage_html, pdp_htmls, reviews_page_html)
+            vis = run_dim("dim_visibility", visibility.score,
+                          homepage_html, pdp_htmls, reviews_page_html)
             all_scores["visibility"] = vis
             await emit("visibility", "complete", **vis)
 
-            # ── Dimension 5: Rich Snippets ────────────────────────────────
+            # ── Dimension 5: Rich Snippets ─────────────────────────────────────
             await emit("rich_snippets", "running", message="Checking schema markup...")
-            rs = rich_snippets.score(pdp_htmls, homepage_html)
+            rs = run_dim("dim_rich_snippets", rich_snippets.score, pdp_htmls, homepage_html)
             all_scores["rich_snippets"] = rs
             await emit("rich_snippets", "complete", **rs)
 
-            # ── Dimension 6: Page Speed ───────────────────────────────────
+            # ── Dimension 6: Page Speed ────────────────────────────────────────
             await emit("page_speed", "running", message="Running PageSpeed Insights...")
-            # Use a real PDP URL for PageSpeed (not just the homepage)
             pdp_for_speed = pdp_urls[0] if pdp_urls else base_url
+            _log("dim_page_speed_url", url=pdp_for_speed)
             async with make_client() as client:
-                ps = await page_speed.score(pdp_for_speed, client, detected_platform)
+                ps = await safe_run(
+                    "dim_page_speed",
+                    page_speed.score(pdp_for_speed, client, detected_platform),
+                    default={"score": 0, "max_score": SCORE_WEIGHTS["page_speed"],
+                             "finding": "PageSpeed check failed."},
+                )
             all_scores["page_speed"] = {
                 "score": ps["score"], "max_score": ps["max_score"], "finding": ps["finding"],
             }
@@ -280,21 +355,21 @@ async def run_scan(
                        score=ps["score"], max_score=ps["max_score"],
                        perf_score=page_speed_score, lcp=page_speed_lcp)
 
-            # ── Dimension 7: Bestseller Depth ─────────────────────────────
+            # ── Dimension 7: Bestseller Depth ──────────────────────────────────
             await emit("bestseller_depth", "running", message="Checking bestseller review depth...")
-            bd = bestseller_depth.score(pdp_htmls)
+            bd = run_dim("dim_bestseller_depth", bestseller_depth.score, pdp_htmls)
             all_scores["bestseller_depth"] = bd
             await emit("bestseller_depth", "complete", **bd)
 
-            # ── Dimension 8: Stars on Category ────────────────────────────
+            # ── Dimension 8: Stars on Category ─────────────────────────────────
             await emit("stars_on_category", "running", message="Checking category page stars...")
-            sc = stars_on_category.score(cat_html, cat_url)
+            sc = run_dim("dim_stars_on_category", stars_on_category.score, cat_html, cat_url)
             all_scores["stars_on_category"] = sc
             await emit("stars_on_category", "complete", **sc)
 
-            # ── Dimension 9: Vertical Signals ─────────────────────────────
+            # ── Dimension 9: Vertical Signals ──────────────────────────────────
             await emit("vertical_signals", "running", message="Detecting vertical...")
-            vs = vertical_signals.score(pdp_htmls, homepage_html)
+            vs = run_dim("dim_vertical_signals", vertical_signals.score, pdp_htmls, homepage_html)
             all_scores["vertical_signals"] = {
                 "score": vs["score"], "max_score": vs["max_score"], "finding": vs["finding"],
             }
@@ -304,16 +379,57 @@ async def run_scan(
                        score=vs["score"], max_score=vs["max_score"],
                        vertical=vertical)
 
-            # ── Screenshots ───────────────────────────────────────────────
+            # ── Score validation ───────────────────────────────────────────────
+            # If no real PDPs were found, PDP-dependent scores must not be fabricated
+            real_pdp_count = len([u for u in pdp_urls if u])
+            if real_pdp_count == 0:
+                log.warning("Score validation: no PDPs found — zeroing PDP-dependent scores")
+                for key in ["review_richness", "review_recency", "bestseller_depth"]:
+                    if all_scores.get(key, {}).get("score", 0) > 0:
+                        _log("score_validation", dimension=key, action="zeroed",
+                             reason="no_pdps_found",
+                             original_score=all_scores[key]["score"])
+                        all_scores[key]["score"] = 0
+                        all_scores[key]["finding"] = (
+                            "Could not access product pages — score zeroed to prevent fabrication."
+                        )
+
+            # If review text samples were empty across ALL PDPs, richness must be 0
+            all_review_texts = []
+            for entry in audit_log:
+                if entry.get("step", "").startswith("pdp_review_audit_"):
+                    all_review_texts.extend(entry.get("review_texts_found", []) or [])
+            # (review_texts_found is a count, not list — so sum it)
+            total_review_texts = sum(
+                entry.get("review_texts_found", 0)
+                for entry in audit_log
+                if entry.get("step", "").startswith("pdp_review_audit_")
+            )
+            if total_review_texts == 0 and all_scores.get("review_richness", {}).get("score", 0) > 0:
+                _log("score_validation", dimension="review_richness", action="zeroed",
+                     reason="no_review_text_extracted",
+                     original_score=all_scores["review_richness"]["score"])
+                all_scores["review_richness"]["score"] = 0
+                all_scores["review_richness"]["finding"] = (
+                    "No review text extracted from any PDP — score zeroed to prevent fabrication."
+                )
+
+            _log("score_validation_complete",
+                 scores_summary={k: v.get("score") for k, v in all_scores.items()})
+
+            # ── Screenshots ────────────────────────────────────────────────────
             if not skip_screenshots:
                 await emit("screenshots", "running", message="Taking targeted screenshots...")
-                screenshots = await auditor.take_screenshots(scan_id, base_url, pdp_urls)
+                screenshots = await safe_run(
+                    "screenshots", auditor.take_screenshots(scan_id, base_url, pdp_urls), default=[]
+                ) or []
+                _log("screenshots_result", count=len(screenshots), paths=screenshots)
                 await emit("screenshots", "complete",
                            message=f"{len(screenshots)} screenshots captured.", count=len(screenshots))
             else:
                 await emit("screenshots", "complete", message="Screenshots skipped.", count=0)
 
-        # ── Compute totals (outside Playwright context) ───────────────────
+        # ── Compute totals (outside Playwright context) ───────────────────────
         total = round(sum(d["score"] for d in all_scores.values()), 1)
         grade = compute_grade(total)
         platform_mismatch = bool(
@@ -334,30 +450,37 @@ async def run_scan(
             )[:5]
         ]
 
-        # ── PDF ───────────────────────────────────────────────────────────
+        # ── PDF ───────────────────────────────────────────────────────────────
         await emit("pdf", "running", message="Generating PDF brief...")
-        pdf_path = generate_pdf(
-            scan_id=scan_id,
-            brand_name=brand_name,
-            domain=clean_domain(base_url),
-            account_owner=account_owner,
-            overall_score=int(total),
-            grade=grade,
-            scores=all_scores,
-            pitch_angles=pitch_angles,
-            detected_platform=detected_platform,
-            sf_platform=sf_reviews_provider,
-            platform_mismatch=platform_mismatch,
-            vertical=vertical,
-            page_speed_score=page_speed_score,
-            page_speed_lcp=page_speed_lcp,
-            screenshot_paths=screenshots,
-            brand_logo_b64=brand_logo_b64,
-            scan_ts=datetime.utcnow().isoformat(),
-        )
+        _log("pdf_started")
+        try:
+            pdf_path = await generate_pdf(
+                scan_id=scan_id,
+                brand_name=brand_name,
+                domain=clean_domain(base_url),
+                account_owner=account_owner,
+                overall_score=int(total),
+                grade=grade,
+                scores=all_scores,
+                pitch_angles=pitch_angles,
+                detected_platform=detected_platform,
+                sf_platform=sf_reviews_provider,
+                platform_mismatch=platform_mismatch,
+                vertical=vertical,
+                page_speed_score=page_speed_score,
+                page_speed_lcp=page_speed_lcp,
+                screenshot_paths=screenshots,
+                brand_logo_b64=brand_logo_b64,
+                scan_ts=datetime.utcnow().isoformat(),
+            )
+            _log("pdf_complete", path=pdf_path)
+        except Exception as e:
+            log.error("PDF generation failed: %s", e, exc_info=True)
+            _log("pdf_failed", error=str(e))
+            pdf_path = None
         await emit("pdf", "complete", message="PDF brief generated.")
 
-        # ── Slinger 3000 ──────────────────────────────────────────────────
+        # ── Slinger 3000 ──────────────────────────────────────────────────────
         await emit("slinger", "running", message="Drafting Slinger 3000 emails...")
         context_str = build_context(
             brand_name=brand_name,
@@ -375,9 +498,10 @@ async def run_scan(
             llm_failed=llm_failed,
         )
         slinger_result = generate_drafts(brand_name, context_str, email_count=3)
+        _log("slinger_complete", drafts_count=len(slinger_result) if slinger_result else 0)
         await emit("slinger", "complete", message="Slinger 3000 drafts ready.")
 
-        # ── Save to DB ────────────────────────────────────────────────────
+        # ── Save to DB ────────────────────────────────────────────────────────
         async with AsyncSessionLocal() as db:
             run = await db.get(ScanRun, scan_id)
             if run:
@@ -398,6 +522,7 @@ async def run_scan(
                 run.pdf_path = pdf_path
                 run.slinger_drafts_json = slinger_result
                 run.screenshots_json = screenshots
+                run.audit_log_json = audit_log
                 await db.commit()
 
         # Normalize screenshot paths for frontend
@@ -432,10 +557,12 @@ async def run_scan(
 
     except Exception as e:
         log.exception("Scan %s failed: %s", scan_id, e)
+        _log("fatal_error", error=str(e))
         async with AsyncSessionLocal() as db:
             run = await db.get(ScanRun, scan_id)
             if run:
                 run.status = "failed"
                 run.error_message = str(e)
+                run.audit_log_json = audit_log
                 await db.commit()
         await _broadcast(broadcast, scan_id, {"type": "error", "message": str(e)})
