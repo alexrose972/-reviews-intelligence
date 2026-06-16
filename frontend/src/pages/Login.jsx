@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../App.jsx'
+import { YotpoMark } from '../components/Nav.jsx'
 
 const ERROR_MSGS = {
   domain:   'This tool is for Yotpo team members only. Sign in with your @yotpo.com Google account.',
@@ -19,24 +20,19 @@ export default function Login() {
   }, [user])
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-yotpo-purple via-purple-900 to-purple-800 flex items-center justify-center p-4">
-      <div className="w-full max-w-sm">
-        {/* Card */}
+    <div className="min-h-screen flex items-center justify-center p-4 bg-yotpo-ink relative overflow-hidden">
+      {/* Brand glow */}
+      <div className="pointer-events-none absolute -top-40 -right-40 w-[36rem] h-[36rem] rounded-full bg-yotpo-purple/30 blur-3xl" />
+      <div className="pointer-events-none absolute -bottom-40 -left-40 w-[32rem] h-[32rem] rounded-full bg-yotpo-accent/20 blur-3xl" />
+
+      <div className="w-full max-w-sm relative animate-fade-up">
         <div className="bg-white rounded-2xl shadow-2xl p-8 text-center">
           {/* Logo */}
-          <div className="flex items-center justify-center gap-2 mb-6">
-            <div className="w-10 h-10 rounded-xl bg-yotpo-purple flex items-center justify-center">
-              <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
-                <path d="M5 7h12M5 11h8M5 15h5" stroke="white" strokeWidth="2" strokeLinecap="round"/>
-              </svg>
-            </div>
-            <div className="text-left">
-              <div className="text-lg font-bold text-yotpo-purple leading-tight">Reviews</div>
-              <div className="text-lg font-bold text-yotpo-purple leading-tight">Intelligence</div>
-            </div>
+          <div className="flex items-center justify-center mb-5">
+            <YotpoMark className="h-8" />
           </div>
-
-          <p className="text-sm text-gray-500 mb-6">
+          <div className="text-sm font-semibold text-gray-900">Reviews Intelligence</div>
+          <p className="text-sm text-gray-500 mt-1.5 mb-6">
             Scan brands, score review experiences,<br />draft outreach — all in one place.
           </p>
 
