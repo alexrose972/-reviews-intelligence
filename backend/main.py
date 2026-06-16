@@ -404,6 +404,72 @@ async def api_chrome_queue(user: dict = Depends(require_auth)):
     }
 
 
+@app.post("/api/chrome-jobs/next")
+async def api_claim_chrome_job(request: Request):
+    """Claim the next queued Browser Scan job (pulled by chrome_runner.py).
+
+    Authenticated with the webhook secret (the runner has no user session).
+    Also reclaims jobs whose runner died mid-scan: past their timeout they are
+    requeued, or failed once max attempts are exhausted.
+    """
+    secret = request.headers.get("X-Webhook-Secret", "")
+    expected = os.environ.get("BROWSER_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    now = datetime.utcnow()
+    async with AsyncSessionLocal() as db:
+        # Reclaim stale 'running' jobs (runner crashed / lost connection)
+        stale = await db.execute(
+            select(ChromeJob).where(
+                ChromeJob.status == "running", ChromeJob.timeout_at <= now
+            )
+        )
+        for j in stale.scalars().all():
+            if (j.attempts or 0) >= (j.max_attempts or 2):
+                j.status = "failed"
+                j.error = "Exceeded max attempts"
+                j.completed_at = now
+                run = await db.get(ScanRun, j.scan_id)
+                if run:
+                    run.chrome_job_status = "failed"
+                    run.chrome_error = j.error
+                    run.chrome_job_completed_at = now
+            else:
+                j.status = "queued"
+        await db.commit()
+
+        # Claim the next queued job (highest priority, oldest first)
+        result = await db.execute(
+            select(ChromeJob)
+            .where(ChromeJob.status == "queued")
+            .order_by(ChromeJob.priority.desc(), ChromeJob.created_at.asc())
+            .limit(1)
+        )
+        job = result.scalar_one_or_none()
+        if not job:
+            return {"job": None}
+
+        job.status = "running"
+        job.started_at = now
+        job.timeout_at = now + timedelta(minutes=15)
+        job.attempts = (job.attempts or 0) + 1
+        run = await db.get(ScanRun, job.scan_id)
+        if run:
+            run.chrome_job_status = "running"
+            run.chrome_job_started_at = now
+        await db.commit()
+
+        return {"job": {
+            "id": str(job.id),
+            "scan_id": str(job.scan_id),
+            "brand": job.brand_name,
+            "domain": job.domain,
+            "base_url": job.base_url,
+            "attempts": job.attempts,
+        }}
+
+
 @app.post("/api/browser-data/{scan_id}")
 async def receive_browser_data(
     scan_id: str,

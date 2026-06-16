@@ -286,20 +286,57 @@ _REVIEW_EXTRACT_JS = """
 
 
 class PlaywrightAuditor:
-    """Manages a single Playwright Chromium browser for a full scan."""
+    """Manages a single Playwright Chromium browser for a full scan.
 
-    def __init__(self):
+    Three drive modes:
+
+    * default (server)   — headless Chromium. Fast, but datacenter IP + headless
+      fingerprint gets blocked by WAFs on premium DTC sites.
+    * ``real_chrome``    — launches the user's installed Chrome (channel="chrome")
+      non-headless. Real browser binary on a residential IP beats most blocks.
+    * ``cdp_url``        — attaches to an already-running Chrome over the DevTools
+      protocol (the user's actual logged-in profile). Effectively undetectable.
+
+    The last two power the Browser Scan fallback (``chrome_runner.py``) — the same
+    extraction code, just executed from a real, non-blocked browser.
+    """
+
+    def __init__(self, cdp_url: Optional[str] = None, real_chrome: bool = False):
         self._pw = None
         self._browser = None
         self._ctx = None
+        self._cdp_url = cdp_url
+        self._real_chrome = real_chrome
+        self._owns_browser = True  # don't close a browser we merely attached to
 
     async def __aenter__(self):
         from playwright.async_api import async_playwright
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=True,
-            args=_LAUNCH_ARGS,
-        )
+
+        if self._cdp_url:
+            # Attach to the user's real, already-running Chrome. Reuse its
+            # existing context so we inherit the real profile / cookies / IP.
+            self._browser = await self._pw.chromium.connect_over_cdp(self._cdp_url)
+            self._owns_browser = False
+            self._ctx = (
+                self._browser.contexts[0]
+                if self._browser.contexts
+                else await self._browser.new_context()
+            )
+            self._ctx.set_default_timeout(30_000)
+            return self
+
+        if self._real_chrome:
+            # Launch the user's installed Chrome (real binary, residential IP),
+            # visible so the user can see / solve any challenge that appears.
+            self._browser = await self._pw.chromium.launch(
+                headless=False, channel="chrome", args=_LAUNCH_ARGS,
+            )
+        else:
+            self._browser = await self._pw.chromium.launch(
+                headless=True, args=_LAUNCH_ARGS,
+            )
+
         self._ctx = await self._browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=UA,
@@ -313,11 +350,16 @@ class PlaywrightAuditor:
         return self
 
     async def __aexit__(self, *_):
-        for obj, method in [
-            (self._ctx, "close"),
-            (self._browser, "close"),
-            (self._pw, "stop"),
-        ]:
+        # When attached over CDP we don't own the browser/context — leave the
+        # user's Chrome open; only stop our Playwright driver.
+        teardown = [(self._pw, "stop")]
+        if self._owns_browser:
+            teardown = [
+                (self._ctx, "close"),
+                (self._browser, "close"),
+                (self._pw, "stop"),
+            ]
+        for obj, method in teardown:
             try:
                 if obj:
                     await getattr(obj, method)()
