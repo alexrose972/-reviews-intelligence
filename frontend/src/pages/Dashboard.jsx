@@ -125,9 +125,12 @@ export default function Dashboard() {
       <Nav />
 
       <main className="max-w-6xl mx-auto px-4 py-8">
-        <div className="mb-8">
-          <h1 className="text-2xl font-bold text-gray-900">Reviews Intelligence</h1>
-          <p className="text-gray-500 mt-1">Score brand review experiences. Generate briefs. Draft outreach.</p>
+        <div className="mb-8 animate-fade-up">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-yotpo-pale px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider text-yotpo-purple mb-3">
+            <span className="w-1.5 h-1.5 rounded-full bg-yotpo-purple" /> Yotpo
+          </span>
+          <h1 className="text-3xl font-extrabold text-gray-900">Reviews Intelligence</h1>
+          <p className="text-gray-500 mt-1.5">Score a brand's review experience, generate the brief, draft the outreach.</p>
         </div>
 
         {/* Chrome Queue panel — shows when there's activity */}
@@ -138,7 +141,7 @@ export default function Dashboard() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* ── Scan a Brand ─────────────────────────────────────────── */}
           <div className="card p-6">
-            <h2 className="text-base font-semibold text-gray-900 mb-5">Scan a Brand</h2>
+            <h2 className="section-title mb-5">Scan a Brand</h2>
 
             {/* Recent check banner */}
             {recentCheck && (
@@ -169,9 +172,7 @@ export default function Dashboard() {
 
             {/* Brand search */}
             <div className="mb-4" ref={dropdownRef}>
-              <label className="block text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1.5">
-                Brand name
-              </label>
+              <label className="field-label">Brand name</label>
               <div className="relative">
                 <input
                   ref={inputRef}
@@ -184,7 +185,7 @@ export default function Dashboard() {
                   }}
                   onFocus={() => setShowDropdown(true)}
                   placeholder="Search Tier 1 accounts…"
-                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-yotpo-purple/30 focus:border-yotpo-purple"
+                  className="input"
                 />
                 {showDropdown && filtered.length > 0 && (
                   <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-lg z-20 max-h-56 overflow-y-auto">
@@ -205,15 +206,13 @@ export default function Dashboard() {
 
             {/* Or custom domain */}
             <div className="mb-5">
-              <label className="block text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1.5">
-                Or enter any domain
-              </label>
+              <label className="field-label">Or enter any domain</label>
               <input
                 type="text"
                 value={customDomain}
                 onChange={e => { setCustomDomain(e.target.value); setSelected(null); setQuery('') }}
                 placeholder="e.g. allbirds.com"
-                className="w-full px-3 py-2.5 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-yotpo-purple/30 focus:border-yotpo-purple"
+                className="input"
               />
             </div>
 
@@ -253,7 +252,7 @@ export default function Dashboard() {
 
           {/* ── Recent Scans ──────────────────────────────────────────── */}
           <div className="card p-6">
-            <h2 className="text-base font-semibold text-gray-900 mb-5">Recent Scans</h2>
+            <h2 className="section-title mb-5">Recent Scans</h2>
 
             {loadingRecent ? (
               <div className="space-y-3">

@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -6,19 +8,39 @@
   body {
     @apply bg-gray-50 text-gray-900 antialiased;
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background-image:
+      radial-gradient(60rem 60rem at 110% -10%, rgba(0,66,228,.05), transparent 60%),
+      radial-gradient(50rem 50rem at -10% 0%, rgba(0,66,228,.04), transparent 55%);
+    background-attachment: fixed;
   }
+  h1, h2, h3 { letter-spacing: -0.01em; }
 }
 
 @layer components {
   .btn-primary {
-    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-yotpo-purple text-white text-sm font-semibold
-           hover:bg-yotpo-light transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-yotpo-purple text-white text-sm font-semibold
+           shadow-sm hover:bg-yotpo-light hover:shadow-ring active:translate-y-px
+           transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none;
   }
   .btn-secondary {
-    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-200 bg-white text-sm font-medium
-           text-gray-700 hover:bg-gray-50 transition-colors;
+    @apply inline-flex items-center gap-2 px-4 py-2.5 rounded-lg border border-gray-200 bg-white text-sm font-medium
+           text-gray-700 hover:bg-gray-50 hover:border-gray-300 transition-colors;
   }
   .card {
-    @apply bg-white rounded-xl border border-gray-100 shadow-sm;
+    @apply bg-white rounded-2xl border border-gray-100 shadow-card;
+  }
+  .input {
+    @apply w-full px-3.5 py-2.5 rounded-lg border border-gray-200 text-sm bg-white
+           placeholder:text-gray-400 transition-shadow
+           focus:outline-none focus:ring-4 focus:ring-yotpo-purple/15 focus:border-yotpo-purple;
+  }
+  .field-label {
+    @apply block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-1.5;
+  }
+  .section-title {
+    @apply text-base font-bold text-gray-900;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-600;
   }
 }

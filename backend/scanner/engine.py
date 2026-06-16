@@ -17,6 +17,7 @@ from .utils import (
     domain_to_url, clean_domain,
 )
 from .browser import PlaywrightAuditor, detect_block
+from .branding import fetch_brand_logo
 from .dimensions import (
     llm_crawlability, review_richness, review_recency,
     visibility, rich_snippets, page_speed,
@@ -326,30 +327,10 @@ async def run_scan(
                        message=f"Found {len(pdp_urls)} product pages.",
                        platform=detected_platform)
 
-            # Extract brand logo
-            try:
-                from bs4 import BeautifulSoup
-                soup_home = BeautifulSoup(homepage_html, "lxml")
-                for hdr in soup_home.find_all(["header", "nav"]):
-                    for img in hdr.find_all("img"):
-                        attrs = " ".join([
-                            (img.get("class") or [""])[0],
-                            img.get("id", ""), img.get("alt", ""), img.get("src", ""),
-                        ]).lower()
-                        if "logo" in attrs and img.get("src"):
-                            from urllib.parse import urljoin as _urljoin
-                            logo_url = _urljoin(base_url, img["src"])
-                            async with make_client() as client:
-                                from .utils import fetch_bytes
-                                raw = await fetch_bytes(client, logo_url)
-                            if raw and len(raw) > 200:
-                                ext = "png" if logo_url.lower().endswith(".png") else "jpeg"
-                                brand_logo_b64 = f"data:image/{ext};base64,{base64.b64encode(raw).decode()}"
-                            break
-                    if brand_logo_b64:
-                        break
-            except Exception:
-                pass
+            # Brand logo for the brief: homepage <img> → Clearbit → favicon
+            brand_logo_b64 = await safe_run(
+                "brand_logo", fetch_brand_logo(domain, homepage_html), default=""
+            ) or ""
 
             # ── Phase 3: PDPs with deep review extraction ─────────────────────
             await emit("review_richness", "running",
