@@ -5,7 +5,7 @@ import logging
 import os
 import secrets
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -308,9 +308,9 @@ async def api_chrome_status(scan_id: str, user: dict = Depends(require_auth)):
         "scan_id": scan_id,
         "scan_mode": run.scan_mode,
         "chrome_job_status": run.chrome_job_status,
-        "chrome_job_queued_at": run.chrome_job_queued_at.isoformat() if run.chrome_job_queued_at else None,
-        "chrome_job_started_at": run.chrome_job_started_at.isoformat() if run.chrome_job_started_at else None,
-        "chrome_job_completed_at": run.chrome_job_completed_at.isoformat() if run.chrome_job_completed_at else None,
+        "chrome_job_queued_at": _iso(run.chrome_job_queued_at),
+        "chrome_job_started_at": _iso(run.chrome_job_started_at),
+        "chrome_job_completed_at": _iso(run.chrome_job_completed_at),
         "chrome_pdps_visited": run.chrome_pdps_visited or 0,
         "chrome_error": run.chrome_error,
         "scan_fallback_reason": run.scan_fallback_reason,
@@ -389,14 +389,14 @@ async def api_chrome_queue(user: dict = Depends(require_auth)):
         "running": {
             "scan_id": str(running_job.scan_id),
             "brand": running_job.brand_name,
-            "started_at": running_job.started_at.isoformat() if running_job.started_at else None,
+            "started_at": _iso(running_job.started_at),
         } if running_job else None,
         "queued": [
             {
                 "scan_id": str(j.scan_id),
                 "brand": j.brand_name,
                 "position": i + 1,
-                "queued_at": j.created_at.isoformat() if j.created_at else None,
+                "queued_at": _iso(j.created_at),
             }
             for i, j in enumerate(queued_jobs)
         ],
@@ -813,6 +813,20 @@ else:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _iso(dt) -> Optional[str]:
+    """Serialize a DB datetime as UTC with an explicit offset.
+
+    Timestamps are stored naive via datetime.utcnow(). A bare isoformat() has
+    no timezone, so the browser's `new Date(...)` parses it as LOCAL time and
+    every 'X min ago' goes negative. Stamping it as UTC fixes the whole UI.
+    """
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
 def _normalize_screenshots(raw) -> list:
     """Convert stored screenshots (list of path strings or dicts) to [{label, path}]."""
     if not raw:
@@ -833,7 +847,7 @@ def _serialize_run(run: ScanRun) -> dict:
         "brand_name": run.brand_name,
         "domain": run.domain,
         "triggered_by": run.triggered_by,
-        "triggered_at": run.triggered_at.isoformat() if run.triggered_at else None,
+        "triggered_at": _iso(run.triggered_at),
         "status": run.status,
         "overall_score": run.overall_score,
         "grade": run.grade,

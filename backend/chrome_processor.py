@@ -37,6 +37,12 @@ async def chrome_job_processor():
     log.info("Chrome processor started (runner_enabled=%s)", RUNNER_ENABLED)
     while True:
         try:
+            if not RUNNER_ENABLED:
+                # No local runner is consuming the queue (e.g. on Railway).
+                # Idle quietly and leave jobs honestly 'queued' rather than
+                # flipping them to a fake 'running' that then times out.
+                await asyncio.sleep(60)
+                continue
             await _handle_timeouts()
             running = await _get_running_job()
             if running:
@@ -113,7 +119,11 @@ async def _update_scan(scan_id, **kwargs):
 
 
 async def process_chrome_job(job: ChromeJob):
-    """Mark job running and dispatch instruction to Chrome."""
+    """Mark job running and dispatch instruction to Chrome.
+
+    Only reached when RUNNER_ENABLED is true — the processor loop idles
+    otherwise, leaving jobs honestly 'queued' for a runner to pick up.
+    """
     now = datetime.utcnow()
     await _update_job(
         job.id,
@@ -131,14 +141,6 @@ async def process_chrome_job(job: ChromeJob):
         webhook_url=WEBHOOK_URL,
         webhook_secret=WEBHOOK_SECRET,
     )
-
-    if not RUNNER_ENABLED:
-        log.info(
-            "CHROME_RUNNER_ENABLED not set — job %s waiting for local runner. "
-            "On your Mac: CHROME_RUNNER_ENABLED=true python -m backend.chrome_runner",
-            job.id,
-        )
-        return
 
     try:
         success = await send_to_claude_in_chrome(instruction, str(job.scan_id))
