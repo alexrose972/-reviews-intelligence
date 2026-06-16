@@ -110,6 +110,95 @@ BESTSELLER_KEYWORDS = [
     "top-rated", "top_rated", "featured",
 ]
 
+# ── Bot-block / challenge detection ─────────────────────────────────────────────
+# Signatures that mean we hit a WAF / captcha / challenge page instead of the
+# real site (Cloudflare, PerimeterX, DataDome, Akamai, Incapsula). If any of
+# these match, we must NOT score the page — we never actually reached the site.
+_BLOCK_SIGNATURES = [
+    "just a moment...",
+    "checking your browser before accessing",
+    "cf-browser-verification",
+    "cf-challenge",
+    "challenge-platform",
+    "_cf_chl_",
+    "attention required! | cloudflare",
+    "/cdn-cgi/challenge",
+    "access denied",
+    "access to this page has been denied",
+    "you have been blocked",
+    "please verify you are a human",
+    "verify you are human",
+    "px-captcha",
+    "perimeterx",
+    "datadome",
+    "captcha-delivery.com",
+    "request unsuccessful. incapsula",
+    "are you a robot",
+    "unusual traffic from your",
+]
+
+_BLOCK_TITLE_HINTS = [
+    "just a moment", "access denied", "attention required",
+    "blocked", "forbidden", "robot", "captcha", "security check",
+]
+
+# Marketing / email-capture modal close selectors (Klaviyo, Privy, Justuno,
+# Attentive, etc.). These popups usually fire on a timer AFTER networkidle, so
+# they slip past the cookie-banner pass and end up in screenshots.
+_MODAL_CLOSE_SELECTORS = [
+    ".klaviyo-close-form",
+    "[class*='klaviyo'] [aria-label*='close' i]",
+    ".privy-close, .privy-popup-close",
+    "[class*='privy'] [class*='close' i]",
+    "button[class*='justuno' i][class*='close' i]",
+    "[id*='attentive'] [aria-label*='close' i]",
+    "[class*='popup' i] button[aria-label*='close' i]",
+    "[class*='modal' i] button[aria-label*='close' i]",
+    "[class*='newsletter' i] [aria-label*='close' i]",
+    "[class*='email-signup' i] [class*='close' i]",
+    "[class*='overlay' i] button[class*='close' i]",
+    "[class*='dialog' i] button[class*='close' i]",
+    "button[aria-label='Close dialog']",
+    "button[aria-label='Close']",
+    "[data-testid*='close' i]",
+]
+
+
+def detect_block(html: Optional[str]) -> Optional[str]:
+    """
+    Return a short reason string if ``html`` looks like a bot-block / challenge /
+    captcha page (or an empty render), else None.
+
+    Used by the engine to avoid scoring a site we never actually reached — a
+    blocked scan must produce a 'blocked' status, NOT a fabricated grade.
+    """
+    if not html:
+        return "page_render_failed"
+
+    lowered = html.lower()
+    for sig in _BLOCK_SIGNATURES:
+        if sig in lowered:
+            return "bot_block_detected"
+
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        title = (soup.title.string or "").strip().lower() if soup.title else ""
+        body_text = soup.get_text(" ", strip=True)
+    except Exception:
+        title = ""
+        body_text = lowered
+
+    # Block title on a suspiciously thin page = challenge interstitial
+    if title and any(h in title for h in _BLOCK_TITLE_HINTS) and len(body_text) < 1500:
+        return "bot_block_detected"
+
+    # Near-empty render — JS never executed or a hard block returned a stub
+    if len(body_text) < 200:
+        return "empty_render"
+
+    return None
+
 # ── JS snippet for structured review extraction ────────────────────────────────
 
 _REVIEW_EXTRACT_JS = """
@@ -249,6 +338,25 @@ class PlaywrightAuditor:
                     await btn.click(timeout=1500)
                     await page.wait_for_timeout(500)
                     break
+            except Exception:
+                pass
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    async def _dismiss_marketing_modals(self, page):
+        """Close email-capture / promo modals (Klaviyo, Privy, Attentive, etc.).
+
+        These commonly appear on a timer after the page settles, so they evade
+        the cookie-banner pass and pollute screenshots ('UNLOCK FREE SHIPPING').
+        """
+        for sel in _MODAL_CLOSE_SELECTORS:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=400):
+                    await btn.click(timeout=1200)
+                    await page.wait_for_timeout(250)
             except Exception:
                 pass
         try:
@@ -566,6 +674,9 @@ class PlaywrightAuditor:
                 await self._wait_idle(page, 6000)
                 if prep:
                     await prep(page)
+                # Late-firing email/promo modals appear after networkidle —
+                # clear them right before the shot so they don't get captured.
+                await self._dismiss_marketing_modals(page)
                 path = out_dir / f"{label}.png"
                 await page.screenshot(path=str(path), full_page=False)
                 log.info("Screenshot saved: %s", path)

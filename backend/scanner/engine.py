@@ -16,7 +16,7 @@ from .utils import (
     make_client, fetch_html, detect_platform, detect_vertical,
     domain_to_url, clean_domain,
 )
-from .browser import PlaywrightAuditor
+from .browser import PlaywrightAuditor, detect_block
 from .dimensions import (
     llm_crawlability, review_richness, review_recency,
     visibility, rich_snippets, page_speed,
@@ -42,6 +42,40 @@ def compute_grade(score: float) -> str:
     return "D"
 
 
+# Phrases that mean a model declined / has no web access — NOT a real site
+# signal. We never surface these as findings or pitch angles.
+_REFUSAL_MARKERS = (
+    "i cannot", "i can't", "i don't have", "unable to access", "i'm not able",
+    "as an ai", "no access", "cannot browse", "can't browse", "i apologize",
+    "i'm unable", "not able to access", "don't have real-time",
+    "do not have the ability", "i'm not able to browse", "can't visit",
+)
+
+
+def _is_refusal(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _REFUSAL_MARKERS)
+
+
+# Human-readable copy for each blocked reason (shown in the UI / stored as
+# error_message). A blocked scan produces NO score.
+_BLOCK_MESSAGES = {
+    "bot_block_detected": (
+        "The live site is behind bot protection (Cloudflare / PerimeterX / "
+        "DataDome) and blocked the scanner. No score was generated — run a "
+        "Browser Scan from a real browser to audit it."
+    ),
+    "page_render_failed": (
+        "The site failed to render (timeout or hard block). No score was "
+        "generated — try a Browser Scan."
+    ),
+    "empty_render": (
+        "The site returned an empty page to the scanner, which usually means a "
+        "block. No score was generated — try a Browser Scan."
+    ),
+}
+
+
 def build_pitch_angles(
     brand_name: str,
     scores: Dict[str, dict],
@@ -55,9 +89,12 @@ def build_pitch_angles(
 ) -> List[str]:
     angles = []
 
+    # Only surface the LLM-quote angle when there is a GENUINE quote — never a
+    # model refusal ("I'm not able to browse the internet…"), which says nothing
+    # about the brand and just makes the brief look broken.
     llm_dim = scores.get("llm_crawlability", {})
-    if llm_failed or llm_dim.get("score", 0) < 10:
-        quote_excerpt = (llm_quote or "I cannot access that information")[:100]
+    if (llm_failed or llm_dim.get("score", 0) < 10) and llm_quote and not _is_refusal(llm_quote):
+        quote_excerpt = llm_quote[:100]
         angles.append(
             f"When we asked Claude to quote a review from {brand_name}'s site, it said: "
             f"\"{quote_excerpt}\". "
@@ -242,8 +279,46 @@ async def run_scan(
             # ── Phase 2: Homepage ─────────────────────────────────────────────
             await emit("fetch", "running", message="Rendering homepage...")
             homepage_html = await safe_run("homepage", auditor.get_html(base_url)) or ""
-            if not homepage_html:
-                raise RuntimeError(f"Could not render {base_url}")
+
+            # ── Bot-block guard ───────────────────────────────────────────────
+            # If we hit a WAF / captcha / challenge page (or got an empty render),
+            # do NOT score it — a fabricated grade off a block page is worse than
+            # no grade. Mark the scan 'blocked' and queue a Browser Scan instead.
+            block_reason = detect_block(homepage_html)
+            if block_reason:
+                msg = _BLOCK_MESSAGES.get(block_reason, "Site could not be reached.")
+                log.warning("Scan %s blocked (%s) for %s", scan_id, block_reason, base_url)
+                _log("scan_blocked", reason=block_reason,
+                     html_len=len(homepage_html) if homepage_html else 0)
+                await emit("fetch", "blocked", message=msg)
+
+                async with AsyncSessionLocal() as db:
+                    run = await db.get(ScanRun, scan_id)
+                    if run:
+                        run.status = "blocked"
+                        run.overall_score = None
+                        run.grade = None
+                        run.scores_json = {}
+                        run.pitch_angles_json = []
+                        run.recommendations_json = []
+                        run.error_message = msg
+                        run.scan_fallback_reason = block_reason
+                        run.audit_log_json = audit_log
+                        await db.commit()
+
+                # Hand off to the Browser Scan queue (consumed by the local
+                # runner — see PR #2). Honest 'queued' state, no fake score.
+                if os.environ.get("CHROME_AUTO_FALLBACK", "true").lower() == "true":
+                    await queue_chrome_job(
+                        scan_id=scan_id, brand_name=brand_name, domain=domain,
+                        base_url=base_url, fallback_reason=block_reason,
+                    )
+
+                await _broadcast(broadcast, scan_id, {
+                    "type": "blocked", "scan_id": scan_id,
+                    "reason": block_reason, "message": msg,
+                })
+                return
 
             detected_platform = detect_platform(homepage_html)
             _log("homepage_rendered", html_len=len(homepage_html), platform=detected_platform)

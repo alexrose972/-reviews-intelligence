@@ -377,6 +377,7 @@ function StatusDot({ status }) {
     running:  'bg-yotpo-purple animate-pulse',
     pending:  'bg-yellow-400',
     failed:   'bg-red-400',
+    blocked:  'bg-amber-400',
   }[status] || 'bg-gray-300'
   return <div className={`w-2 h-2 rounded-full flex-shrink-0 ${cls}`} />
 }

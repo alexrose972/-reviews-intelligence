@@ -99,6 +99,14 @@ export default function ScanResults() {
       } else if (msg.type === 'error') {
         setError(msg.message)
         setStatus('failed')
+      } else if (msg.type === 'blocked') {
+        setError(msg.message)
+        setStatus('blocked')
+        // Refresh to pick up chrome_job_status / fallback reason for the banner
+        fetch(`/api/scans/${id}`, { credentials: 'include' })
+          .then(r => r.json())
+          .then(data => setScan(data))
+          .catch(() => {})
       } else if (msg.type === 'already_complete' || msg.type === 'status') {
         setScan(msg.result)
         setStatus(msg.result?.status === 'failed' ? 'failed' : 'complete')
@@ -200,6 +208,19 @@ export default function ScanResults() {
           <div className="card p-6">
             <ScanProgress events={events} brandName={scan?.brand_name || ''} />
           </div>
+        )}
+
+        {/* ── Blocked state (bot protection — no score generated) ── */}
+        {status === 'blocked' && (
+          <BlockedCard
+            scan={scan}
+            error={error}
+            onTrigger={triggerChromeScan}
+            triggering={triggeringChrome}
+            onRescan={rescan}
+            rescanning={rescanning}
+            onBack={() => navigate('/')}
+          />
         )}
 
         {/* ── Failed state ── */}
@@ -403,6 +424,49 @@ function ChromeStatusBanner({ jobStatus, brandName, fallbackReason, chromeStatus
           {chromeStatus.chrome_pdps_visited} product pages visited
         </p>
       )}
+    </div>
+  )
+}
+
+// ── Blocked state (bot protection blocked the scanner) ─────────────────────────
+
+function BlockedCard({ scan, error, onTrigger, triggering, onRescan, rescanning, onBack }) {
+  const jobStatus = scan?.chrome_job_status
+  const browserPending = jobStatus === 'queued' || jobStatus === 'running'
+  const message = error || scan?.error_message ||
+    'The live site blocked the scanner. No score was generated.'
+
+  return (
+    <div className="card p-6 text-center">
+      <div className="w-12 h-12 rounded-full bg-amber-100 flex items-center justify-center mx-auto mb-3">
+        <span className="text-2xl">🛡️</span>
+      </div>
+      <p className="text-sm font-semibold text-gray-800 mb-1">
+        Couldn’t reach the live site
+      </p>
+      <p className="text-xs text-gray-500 max-w-md mx-auto">{message}</p>
+
+      <div className="flex items-center justify-center gap-2 mt-4">
+        {browserPending ? (
+          <span className="text-sm text-blue-600 font-medium">
+            🌐 Browser scan queued — waiting for a runner…
+          </span>
+        ) : (
+          <button
+            onClick={onTrigger}
+            disabled={triggering}
+            className="btn-primary text-sm py-1.5 px-4"
+          >
+            {triggering ? 'Queuing…' : '🌐 Run Browser Scan'}
+          </button>
+        )}
+        <button onClick={onRescan} disabled={rescanning} className="btn-secondary text-sm py-1.5 px-4">
+          {rescanning ? 'Starting…' : 'Re-scan'}
+        </button>
+        <button onClick={onBack} className="btn-secondary text-sm py-1.5 px-4">
+          Back to Dashboard
+        </button>
+      </div>
     </div>
   )
 }
