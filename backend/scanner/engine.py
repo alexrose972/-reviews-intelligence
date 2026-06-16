@@ -1,38 +1,32 @@
-"""Main scan orchestration with WebSocket progress broadcasting."""
+"""Main scan orchestration — Playwright-first, full JS rendering."""
 
 import asyncio
 import base64
 import logging
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import AsyncSessionLocal, ScanRun
 from .utils import (
     SCORE_WEIGHTS, VERTICAL_PLAYS, WHY_IT_MATTERS, DIMENSION_LABELS,
-    make_client, fetch_html, fetch_bytes, detect_platform, detect_vertical,
-    domain_to_url, clean_domain, find_bestseller_urls, find_pdp_urls,
+    make_client, fetch_html, detect_platform, detect_vertical,
+    domain_to_url, clean_domain,
 )
+from .browser import PlaywrightAuditor
 from .dimensions import (
     llm_crawlability, review_richness, review_recency,
     visibility, rich_snippets, page_speed,
     bestseller_depth, stars_on_category, vertical_signals,
 )
-from .screenshots import capture as take_screenshots
 from .pdf_generator import generate as generate_pdf
 from .slinger import build_context, generate_drafts
 
 log = logging.getLogger("scanner.engine")
 
-# Broadcast callback type: async fn(scan_id, message_dict)
 BroadcastFn = Callable[[str, Dict[str, Any]], None]
-
-
-def _grade_color(grade: str) -> str:
-    return {"A": "#27ae60", "B": "#e67e22", "C": "#f39c12", "D": "#e74c3c"}.get(grade, "#999")
 
 
 def compute_grade(score: float) -> str:
@@ -55,7 +49,6 @@ def build_pitch_angles(
 ) -> List[str]:
     angles = []
 
-    # LLM crawlability failure
     llm_dim = scores.get("llm_crawlability", {})
     if llm_failed or llm_dim.get("score", 0) < 10:
         quote_excerpt = (llm_quote or "I cannot access that information")[:100]
@@ -65,9 +58,8 @@ def build_pitch_angles(
             f"That's what every AI assistant sees when shoppers ask for recommendations."
         )
 
-    # Page speed (especially heavy platforms)
     ps_dim = scores.get("page_speed", {})
-    if ps_dim.get("score", MAX := SCORE_WEIGHTS["page_speed"]) < 6:
+    if ps_dim.get("score", SCORE_WEIGHTS["page_speed"]) < 6:
         platform_note = (
             f" (your {detected_platform} widget is part of this)"
             if detected_platform in {"BazaarVoice", "PowerReviews"} else ""
@@ -77,7 +69,6 @@ def build_pitch_angles(
             f"At 100ms of delay per 1% conversion loss, that adds up fast on mobile."
         )
 
-    # Review recency
     rec_dim = scores.get("review_recency", {})
     if rec_dim.get("score", 99) < 8:
         angles.append(
@@ -85,26 +76,22 @@ def build_pitch_angles(
             f"60% of shoppers won't buy if the newest review is that stale."
         )
 
-    # Rich snippets
     rs_dim = scores.get("rich_snippets", {})
     if rs_dim.get("score", 99) == 0:
         angles.append(
-            f"{brand_name} is missing AggregateRating schema, which means no star ratings "
+            f"{brand_name} is missing AggregateRating schema — no star ratings "
             f"in Google search results. Every competitor with schema gets a visual edge."
         )
 
-    # Vertical play
     if vertical_play and len(angles) < 3:
         angles.append(vertical_play)
 
-    # Platform mismatch
     if platform_mismatch and len(angles) < 3:
         angles.append(
             f"Salesforce shows {sf_platform} but the scanner detected "
-            f"{detected_platform} on the live site. Worth a quick check before outreach."
+            f"{detected_platform} on the live site. Worth confirming before outreach."
         )
 
-    # Stars on category
     sc_dim = scores.get("stars_on_category", {})
     if sc_dim.get("score", 99) == 0 and len(angles) < 3:
         angles.append(
@@ -112,7 +99,6 @@ def build_pitch_angles(
             f"Adding them (like True Religion on their denim collections) can lift CTR ~30%."
         )
 
-    # Bestseller depth fallback
     bd_dim = scores.get("bestseller_depth", {})
     if bd_dim.get("score", 99) < 6 and len(angles) < 3:
         angles.append(
@@ -142,15 +128,14 @@ async def run_scan(
     skip_screenshots: bool = False,
     broadcast: Optional[BroadcastFn] = None,
 ):
-    """Full scan pipeline. Saves results to DB, broadcasts progress via WebSocket."""
+    """Full scan pipeline using Playwright for all page analysis."""
 
     async def emit(step: str, status: str, **extra):
         await _broadcast(broadcast, scan_id, {"type": "progress", "step": step, "status": status, **extra})
 
     base_url = domain_to_url(domain)
-    log.info("Starting scan %s for %s (%s)", scan_id, brand_name, base_url)
+    log.info("Starting Playwright scan %s for %s (%s)", scan_id, brand_name, base_url)
 
-    # Mark as running
     async with AsyncSessionLocal() as db:
         result = await db.get(ScanRun, scan_id)
         if result:
@@ -170,62 +155,80 @@ async def run_scan(
     screenshots: List[str] = []
 
     try:
-        async with make_client() as client:
-            await emit("fetch", "running", message=f"Fetching {domain}...")
+        async with PlaywrightAuditor() as auditor:
 
-            # Fetch homepage
-            homepage_html = await fetch_html(client, base_url) or ""
+            # ── Phase 1: Find real PDP URLs by navigating the site ────────
+            await emit("fetch", "running", message=f"Navigating {domain} to find product pages...")
+            pdp_urls = await auditor.find_pdp_urls(base_url)
+
+            # ── Phase 2: Render homepage (JS-executed) ────────────────────
+            await emit("fetch", "running", message="Rendering homepage...")
+            homepage_html = await auditor.get_html(base_url) or ""
             if not homepage_html:
-                raise RuntimeError(f"Could not reach {base_url}")
+                raise RuntimeError(f"Could not render {base_url}")
 
-            # Detect platform
             detected_platform = detect_platform(homepage_html)
-            await emit("fetch", "complete", message="Homepage fetched.", platform=detected_platform)
+            await emit("fetch", "complete",
+                       message=f"Found {len(pdp_urls)} product pages.",
+                       platform=detected_platform)
 
-            # Fetch brand logo
+            # Extract brand logo
             try:
                 from bs4 import BeautifulSoup
-                from .utils import extract_jsonld
-                soup = BeautifulSoup(homepage_html, "lxml")
-                logo_url = None
-                for hdr in soup.find_all(["header", "nav"]):
+                soup_home = BeautifulSoup(homepage_html, "lxml")
+                for hdr in soup_home.find_all(["header", "nav"]):
                     for img in hdr.find_all("img"):
                         attrs = " ".join([
                             (img.get("class") or [""])[0],
                             img.get("id", ""), img.get("alt", ""), img.get("src", ""),
                         ]).lower()
                         if "logo" in attrs and img.get("src"):
-                            logo_url = img["src"]
+                            from urllib.parse import urljoin as _urljoin
+                            logo_url = _urljoin(base_url, img["src"])
+                            async with make_client() as client:
+                                from .utils import fetch_bytes
+                                raw = await fetch_bytes(client, logo_url)
+                            if raw and len(raw) > 200:
+                                ext = "png" if logo_url.lower().endswith(".png") else "jpeg"
+                                brand_logo_b64 = f"data:image/{ext};base64,{base64.b64encode(raw).decode()}"
                             break
-                    if logo_url:
+                    if brand_logo_b64:
                         break
-                if logo_url:
-                    from urllib.parse import urljoin
-                    raw = await fetch_bytes(client, urljoin(base_url, logo_url))
-                    if raw and len(raw) > 200:
-                        ext = "png" if logo_url.lower().endswith(".png") else "jpeg"
-                        brand_logo_b64 = f"data:image/{ext};base64,{base64.b64encode(raw).decode()}"
             except Exception:
                 pass
 
-            # Fetch PDPs
-            page_pairs = await find_bestseller_urls(client, base_url)
-            pdp_urls: List[str] = []
-            for _, html in page_pairs:
-                pdp_urls.extend(await find_pdp_urls(client, base_url, html))
-            pdp_urls = list(dict.fromkeys(pdp_urls))[:5]
-
+            # ── Phase 3: Render each PDP with full JS + scroll to reviews ─
+            await emit("review_richness", "running",
+                       message=f"Rendering {len(pdp_urls)} product pages (JS + review scroll)...")
             pdp_htmls: List[str] = []
-            for u in pdp_urls:
-                h = await fetch_html(client, u)
-                if h:
-                    pdp_htmls.append(h)
-            if not pdp_htmls and homepage_html:
+            for i, url in enumerate(pdp_urls[:5]):
+                log.info("Rendering PDP %d/%d: %s", i + 1, len(pdp_urls), url)
+                html = await auditor.get_html(url, wait_for_reviews=True)
+                if html:
+                    pdp_htmls.append(html)
+
+            if not pdp_htmls:
+                log.warning("No PDPs rendered — falling back to homepage")
                 pdp_htmls = [homepage_html]
+
+            # ── Phase 4: Render category page ─────────────────────────────
+            await emit("stars_on_category", "running", message="Rendering category page...")
+            cat_url, cat_html = await auditor.get_category_html(base_url)
+
+            # ── Phase 5: Try to render a /reviews page for visibility check ─
+            reviews_page_html: Optional[str] = None
+            for path in ["/reviews", "/testimonials", "/customer-reviews"]:
+                html = await auditor.get_html(urljoin(base_url, path))
+                if html and len(html) > 2000:
+                    reviews_page_html = html
+                    break
 
             # ── Dimension 1: LLM Crawlability ─────────────────────────────
             await emit("llm_crawlability", "running", message="Probing LLM crawlability...")
-            llm_result = await llm_crawlability.score(base_url, client, skip_llm)
+            # Use first PDP for schema check (JS-rendered)
+            llm_result = await llm_crawlability.score(
+                base_url, pdp_htmls[0] if pdp_htmls else homepage_html, skip_llm
+            )
             all_scores["llm_crawlability"] = {
                 "score": llm_result["score"],
                 "max_score": llm_result["max_score"],
@@ -252,7 +255,7 @@ async def run_scan(
 
             # ── Dimension 4: Visibility ───────────────────────────────────
             await emit("visibility", "running", message="Checking review discoverability...")
-            vis = await visibility.score(base_url, client, homepage_html, pdp_htmls)
+            vis = visibility.score(homepage_html, pdp_htmls, reviews_page_html)
             all_scores["visibility"] = vis
             await emit("visibility", "complete", **vis)
 
@@ -264,25 +267,28 @@ async def run_scan(
 
             # ── Dimension 6: Page Speed ───────────────────────────────────
             await emit("page_speed", "running", message="Running PageSpeed Insights...")
-            ps = await page_speed.score(base_url, client, detected_platform)
+            # Use a real PDP URL for PageSpeed (not just the homepage)
+            pdp_for_speed = pdp_urls[0] if pdp_urls else base_url
+            async with make_client() as client:
+                ps = await page_speed.score(pdp_for_speed, client, detected_platform)
             all_scores["page_speed"] = {
                 "score": ps["score"], "max_score": ps["max_score"], "finding": ps["finding"],
             }
             page_speed_score = ps.get("perf_score")
-            page_speed_lcp   = ps.get("lcp", "")
+            page_speed_lcp = ps.get("lcp", "")
             await emit("page_speed", "complete",
                        score=ps["score"], max_score=ps["max_score"],
                        perf_score=page_speed_score, lcp=page_speed_lcp)
 
             # ── Dimension 7: Bestseller Depth ─────────────────────────────
             await emit("bestseller_depth", "running", message="Checking bestseller review depth...")
-            bd = await bestseller_depth.score(base_url, client)
+            bd = bestseller_depth.score(pdp_htmls)
             all_scores["bestseller_depth"] = bd
             await emit("bestseller_depth", "complete", **bd)
 
             # ── Dimension 8: Stars on Category ────────────────────────────
             await emit("stars_on_category", "running", message="Checking category page stars...")
-            sc = await stars_on_category.score(base_url, client)
+            sc = stars_on_category.score(cat_html, cat_url)
             all_scores["stars_on_category"] = sc
             await emit("stars_on_category", "complete", **sc)
 
@@ -298,7 +304,16 @@ async def run_scan(
                        score=vs["score"], max_score=vs["max_score"],
                        vertical=vertical)
 
-        # ── Compute totals ────────────────────────────────────────────────
+            # ── Screenshots ───────────────────────────────────────────────
+            if not skip_screenshots:
+                await emit("screenshots", "running", message="Taking targeted screenshots...")
+                screenshots = await auditor.take_screenshots(scan_id, base_url, pdp_urls)
+                await emit("screenshots", "complete",
+                           message=f"{len(screenshots)} screenshots captured.", count=len(screenshots))
+            else:
+                await emit("screenshots", "complete", message="Screenshots skipped.", count=0)
+
+        # ── Compute totals (outside Playwright context) ───────────────────
         total = round(sum(d["score"] for d in all_scores.values()), 1)
         grade = compute_grade(total)
         platform_mismatch = bool(
@@ -313,17 +328,11 @@ async def run_scan(
 
         recommendations = [
             f"[{DIMENSION_LABELS.get(k, k)}] {v.get('finding', '')} — {WHY_IT_MATTERS.get(k, '')}"
-            for k, v in sorted(all_scores.items(), key=lambda x: x[1].get("score", 0) / max(x[1].get("max_score", 1), 1))[:5]
+            for k, v in sorted(
+                all_scores.items(),
+                key=lambda x: x[1].get("score", 0) / max(x[1].get("max_score", 1), 1)
+            )[:5]
         ]
-
-        # ── Screenshots ───────────────────────────────────────────────────
-        if not skip_screenshots:
-            await emit("screenshots", "running", message="Taking screenshots...")
-            screenshots = await take_screenshots(scan_id, base_url)
-            await emit("screenshots", "complete",
-                       message=f"{len(screenshots)} screenshots captured.", count=len(screenshots))
-        else:
-            await emit("screenshots", "complete", message="Screenshots skipped.", count=0)
 
         # ── PDF ───────────────────────────────────────────────────────────
         await emit("pdf", "running", message="Generating PDF brief...")
@@ -391,8 +400,7 @@ async def run_scan(
                 run.screenshots_json = screenshots
                 await db.commit()
 
-        # Normalize screenshot paths → [{label, path}] so the frontend can
-        # construct /api/scans/{id}/screenshot/{label} URLs directly
+        # Normalize screenshot paths for frontend
         from pathlib import Path as _Path
         normalized_screenshots = [
             {"label": _Path(p).stem, "path": p}

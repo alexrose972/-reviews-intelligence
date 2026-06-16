@@ -49,9 +49,13 @@ WHY_IT_MATTERS = {
 
 # Maps screenshot file stem → (dimension key for finding, friendly page title)
 SCREENSHOT_META = {
-    "homepage":       ("visibility",        "Homepage"),
-    "category_stars": ("stars_on_category", "Category Page"),
-    "bestsellers":    ("bestseller_depth",  "Best-Sellers Page"),
+    # New Playwright-targeted labels
+    "pdp_reviews":      ("review_richness",   "PDP — Reviews Section"),
+    "category_stars":   ("stars_on_category", "Category Page"),
+    "pdp_above_fold":   ("visibility",        "PDP — Above the Fold"),
+    # Legacy labels (older scans)
+    "homepage":         ("visibility",        "Homepage"),
+    "bestsellers":      ("bestseller_depth",  "Best-Sellers Page"),
 }
 
 

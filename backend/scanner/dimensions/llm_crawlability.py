@@ -4,7 +4,6 @@ import os
 from typing import Optional
 
 import anthropic
-import httpx
 
 from ..utils import SCORE_WEIGHTS, clean_domain, extract_jsonld, has_aggregate_rating, has_review_schema
 
@@ -19,28 +18,26 @@ VAGUE_SIGNALS = [
 
 async def score(
     domain_url: str,
-    client: httpx.AsyncClient,
+    rendered_html: str,        # Playwright-rendered HTML (includes JS-injected schema)
     skip_llm: bool = False,
 ) -> dict:
+    """
+    Two sub-signals:
+      A. LLM probe — ask Claude to quote a review. If it can't, reviews aren't crawlable.
+      B. Schema markup — AggregateRating / Review JSON-LD in the rendered DOM.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
-    homepage_html = ""
-    try:
-        r = await client.get(domain_url, timeout=20)
-        homepage_html = r.text
-    except Exception:
-        pass
-
-    jsonld = extract_jsonld(homepage_html) if homepage_html else []
+    # Extract schema from JS-rendered HTML (catches schema injected via JS)
+    jsonld = extract_jsonld(rendered_html) if rendered_html else []
     has_schema = has_aggregate_rating(jsonld) or has_review_schema(jsonld)
 
     if skip_llm or not api_key:
         pts = (MAX_PTS * 0.5) + (6 if has_schema else 0)
-        pts = min(pts, MAX_PTS)
         return {
-            "score": round(pts, 1),
+            "score": round(min(pts, MAX_PTS), 1),
             "max_score": MAX_PTS,
-            "finding": "LLM probe skipped. " + ("Schema markup: present." if has_schema else "Schema markup: missing."),
+            "finding": "LLM probe skipped. Schema: " + ("present." if has_schema else "missing."),
             "review_quote": "",
             "complaint_quote": "",
             "failed": False,
@@ -86,7 +83,7 @@ async def score(
             llm_failed = True
             finding = (
                 f"Claude cannot read reviews on {clean_domain(domain_url)}. "
-                f"When asked to quote a review, it said: \"{quote_response[:120]}...\""
+                f"Response: \"{quote_response[:120]}...\""
             )
         else:
             finding = (
