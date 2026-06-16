@@ -23,6 +23,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from .auth import get_google_auth_url, handle_oauth_callback, require_auth
 from .database import AsyncSessionLocal, ChromeJob, ScanRun, User, init_db
 from .scanner.engine import run_scan
+from .scanner.branding import fetch_brand_logo
 from .sf_client import search_sf_accounts
 from .chrome_converter import ChromeAuditData, chrome_data_to_signals, score_from_chrome_data
 from .chrome_processor import chrome_job_processor, queue_chrome_job
@@ -253,7 +254,7 @@ async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
         page_speed_score=None,
         page_speed_lcp="",
         screenshot_paths=screenshot_paths,
-        brand_logo_b64="",
+        brand_logo_b64=await fetch_brand_logo(run.domain),
         scan_ts=run.triggered_at.isoformat() if run.triggered_at else "",
     )
 
@@ -574,7 +575,7 @@ async def receive_browser_data(
             page_speed_score=data.page_speed.score,
             page_speed_lcp=f"{data.page_speed.lcp_ms}ms" if data.page_speed.lcp_ms else "",
             screenshot_paths=saved_screenshots,
-            brand_logo_b64="",
+            brand_logo_b64=await fetch_brand_logo(run.domain),
             scan_ts=data.audited_at or datetime.utcnow().isoformat(),
         )
     except Exception as e:
