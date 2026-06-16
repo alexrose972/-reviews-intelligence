@@ -285,6 +285,28 @@ _REVIEW_EXTRACT_JS = """
 """
 
 
+def _parse_proxy(proxy_url):
+    """Parse a PROXY_URL (e.g. ``http://user:pass@host:port``) into Playwright's
+    proxy dict, or None. Credentials are split out, as Playwright requires the
+    server and username/password separately. Provider-agnostic.
+    """
+    if not proxy_url:
+        return None
+    from urllib.parse import urlparse
+    p = urlparse(proxy_url if "://" in proxy_url else "http://" + proxy_url)
+    if not p.hostname:
+        return None
+    server = f"{p.scheme}://{p.hostname}"
+    if p.port:
+        server += f":{p.port}"
+    proxy = {"server": server}
+    if p.username:
+        proxy["username"] = p.username
+    if p.password:
+        proxy["password"] = p.password
+    return proxy
+
+
 class PlaywrightAuditor:
     """Manages a single Playwright Chromium browser for a full scan.
 
@@ -301,12 +323,14 @@ class PlaywrightAuditor:
     extraction code, just executed from a real, non-blocked browser.
     """
 
-    def __init__(self, cdp_url: Optional[str] = None, real_chrome: bool = False):
+    def __init__(self, cdp_url: Optional[str] = None, real_chrome: bool = False,
+                 proxy_url: Optional[str] = None):
         self._pw = None
         self._browser = None
         self._ctx = None
         self._cdp_url = cdp_url
         self._real_chrome = real_chrome
+        self._proxy = _parse_proxy(proxy_url)  # residential proxy (retry-on-block)
         self._owns_browser = True  # don't close a browser we merely attached to
 
     async def __aenter__(self):
@@ -326,15 +350,20 @@ class PlaywrightAuditor:
             self._ctx.set_default_timeout(30_000)
             return self
 
+        launch_kwargs = {"args": _LAUNCH_ARGS}
+        if self._proxy:
+            launch_kwargs["proxy"] = self._proxy
+            log.info("Launching Chromium through proxy %s", self._proxy.get("server"))
+
         if self._real_chrome:
             # Launch the user's installed Chrome (real binary, residential IP),
             # visible so the user can see / solve any challenge that appears.
             self._browser = await self._pw.chromium.launch(
-                headless=False, channel="chrome", args=_LAUNCH_ARGS,
+                headless=False, channel="chrome", **launch_kwargs,
             )
         else:
             self._browser = await self._pw.chromium.launch(
-                headless=True, args=_LAUNCH_ARGS,
+                headless=True, **launch_kwargs,
             )
 
         self._ctx = await self._browser.new_context(

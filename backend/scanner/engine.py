@@ -206,8 +206,13 @@ async def run_scan(
     skip_llm: bool = False,
     skip_screenshots: bool = False,
     broadcast: Optional[BroadcastFn] = None,
+    use_proxy: bool = False,
 ):
-    """Full scan pipeline using Playwright for all page analysis."""
+    """Full scan pipeline using Playwright for all page analysis.
+
+    ``use_proxy`` routes Chromium through ``PROXY_URL`` (a residential proxy).
+    Set automatically on the retry after a blocked first pass — see below.
+    """
 
     async def emit(step: str, status: str, **extra):
         await _broadcast(broadcast, scan_id, {"type": "progress", "step": step, "status": status, **extra})
@@ -269,7 +274,9 @@ async def run_scan(
             return {"score": 0, "max_score": max_s, "finding": f"Scoring error: {exc}"}
 
     try:
-        async with PlaywrightAuditor() as auditor:
+        async with PlaywrightAuditor(
+            proxy_url=(os.environ.get("PROXY_URL") or None) if use_proxy else None
+        ) as auditor:
 
             # ── Phase 1: PDP Discovery ────────────────────────────────────────
             await emit("fetch", "running", message=f"Navigating {domain} to find product pages...")
@@ -287,8 +294,27 @@ async def run_scan(
             # no grade. Mark the scan 'blocked' and queue a Browser Scan instead.
             block_reason = detect_block(homepage_html)
             if block_reason:
+                # Retry once through a residential proxy before giving up — most
+                # datacenter-IP blocks clear when the request comes from a
+                # residential IP. Only paid bandwidth is spent on blocked sites.
+                proxy_url = os.environ.get("PROXY_URL", "").strip()
+                if proxy_url and not use_proxy:
+                    log.info("Scan %s blocked (%s) — retrying via residential proxy",
+                             scan_id, block_reason)
+                    _log("proxy_retry", reason=block_reason)
+                    await emit("fetch", "running",
+                               message="Site blocked the scanner — retrying through a residential proxy...")
+                    return await run_scan(
+                        scan_id=scan_id, brand_name=brand_name, domain=domain,
+                        account_owner=account_owner, sf_reviews_provider=sf_reviews_provider,
+                        triggered_by=triggered_by, skip_llm=skip_llm,
+                        skip_screenshots=skip_screenshots, broadcast=broadcast,
+                        use_proxy=True,
+                    )
+
                 msg = _BLOCK_MESSAGES.get(block_reason, "Site could not be reached.")
-                log.warning("Scan %s blocked (%s) for %s", scan_id, block_reason, base_url)
+                log.warning("Scan %s blocked (%s) for %s%s", scan_id, block_reason, base_url,
+                            " [proxy retry also blocked]" if use_proxy else "")
                 _log("scan_blocked", reason=block_reason,
                      html_len=len(homepage_html) if homepage_html else 0)
                 await emit("fetch", "blocked", message=msg)
