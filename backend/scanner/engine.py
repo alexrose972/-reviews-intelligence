@@ -391,6 +391,15 @@ async def run_scan(
                 run.screenshots_json = screenshots
                 await db.commit()
 
+        # Normalize screenshot paths → [{label, path}] so the frontend can
+        # construct /api/scans/{id}/screenshot/{label} URLs directly
+        from pathlib import Path as _Path
+        normalized_screenshots = [
+            {"label": _Path(p).stem, "path": p}
+            for p in screenshots
+            if isinstance(p, str)
+        ]
+
         full_result = {
             "id": scan_id,
             "brand_name": brand_name,
@@ -405,7 +414,7 @@ async def run_scan(
             "sf_platform": sf_reviews_provider,
             "platform_mismatch": platform_mismatch,
             "slinger_drafts": slinger_result,
-            "screenshots": screenshots,
+            "screenshots": normalized_screenshots,
             "pdf_path": pdf_path,
             "vertical": vertical,
             "page_speed_score": page_speed_score,

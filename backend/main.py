@@ -197,49 +197,76 @@ async def api_get_scan(scan_id: str, user: dict = Depends(require_auth)):
 
 @app.get("/api/scans/{scan_id}/pdf")
 async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
+    """Generate PDF in-memory from DB data — no volume/file dependency."""
     import re as _re
+    from fastapi.responses import Response as FastAPIResponse
+    from .scanner.pdf_generator import render_html
+
     async with AsyncSessionLocal() as db:
         run = await db.get(ScanRun, scan_id)
-    if not run or not run.pdf_path:
-        raise HTTPException(404, "PDF not found")
-    path = Path(run.pdf_path)
-    if not path.exists():
-        raise HTTPException(404, "PDF file not found on disk")
+    if not run:
+        raise HTTPException(404, "Scan not found")
+    if run.status != "complete":
+        raise HTTPException(404, "Scan not complete yet")
 
-    # If WeasyPrint failed at scan time we stored an .html fallback — try converting now
-    if path.suffix != ".pdf":
-        pdf_path = path.with_suffix(".pdf")
-        if pdf_path.exists():
-            path = pdf_path
-        else:
-            try:
-                from weasyprint import HTML as WeasyHTML
-                log.info("On-demand PDF conversion for scan %s", scan_id)
-                WeasyHTML(filename=str(path)).write_pdf(str(pdf_path))
-                log.info("On-demand PDF written to %s", pdf_path)
-                # Persist the new path so future downloads are instant
-                async with AsyncSessionLocal() as db2:
-                    run2 = await db2.get(ScanRun, scan_id)
-                    if run2:
-                        run2.pdf_path = str(pdf_path)
-                        await db2.commit()
-                path = pdf_path
-            except Exception as exc:
-                log.error("On-demand WeasyPrint failed for scan %s: %s", scan_id, exc, exc_info=True)
-                raise HTTPException(500, f"PDF generation failed: {exc}")
+    # Resolve screenshot paths from DB (may be strings or {label,path} dicts)
+    raw_screenshots = run.screenshots_json or []
+    screenshot_paths = []
+    for item in raw_screenshots:
+        if isinstance(item, str):
+            screenshot_paths.append(item)
+        elif isinstance(item, dict) and "path" in item:
+            screenshot_paths.append(item["path"])
+
+    html = render_html(
+        brand_name=run.brand_name,
+        domain=run.domain,
+        account_owner=run.triggered_by or "",
+        overall_score=run.overall_score or 0,
+        grade=run.grade or "D",
+        scores=run.scores_json or {},
+        pitch_angles=run.pitch_angles_json or [],
+        detected_platform=run.detected_platform,
+        sf_platform=run.sf_platform,
+        platform_mismatch=run.platform_mismatch or False,
+        vertical=None,
+        page_speed_score=None,
+        page_speed_lcp="",
+        screenshot_paths=screenshot_paths,
+        brand_logo_b64="",
+        scan_ts=run.triggered_at.isoformat() if run.triggered_at else "",
+    )
 
     safe = _re.sub(r"[^\w]", "_", run.brand_name)
     filename = f"{safe}_audit.pdf"
-    return FileResponse(
-        str(path),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+
+    try:
+        from weasyprint import HTML as WeasyHTML
+        log.info("Generating PDF for scan %s", scan_id)
+        pdf_bytes = WeasyHTML(string=html).write_pdf()
+        log.info("PDF generated: %d bytes for scan %s", len(pdf_bytes), scan_id)
+        return FastAPIResponse(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as exc:
+        log.error("WeasyPrint failed for scan %s: %s", scan_id, exc, exc_info=True)
+        # Return the HTML so the user can File → Print → Save as PDF
+        return FastAPIResponse(
+            content=html,
+            media_type="text/html; charset=utf-8",
+            headers={"Content-Disposition": f'inline; filename="{filename}.html"'},
+        )
 
 
 @app.get("/api/scans/{scan_id}/screenshot/{label}")
 async def api_screenshot(scan_id: str, label: str, user: dict = Depends(require_auth)):
-    shot_path = Path("/screenshots") / scan_id / f"{label}.png"
+    import re as _re
+    # capture() sanitizes hyphens → underscores; match that here
+    safe_id = _re.sub(r"[^\w]", "_", scan_id)
+    ss_base = Path(os.environ.get("SCREENSHOTS_DIR", "/screenshots"))
+    shot_path = ss_base / safe_id / f"{label}.png"
     if not shot_path.exists():
         raise HTTPException(404, "Screenshot not found")
     return FileResponse(str(shot_path), media_type="image/png")
@@ -437,6 +464,20 @@ else:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _normalize_screenshots(raw) -> list:
+    """Convert stored screenshots (list of path strings or dicts) to [{label, path}]."""
+    if not raw:
+        return []
+    result = []
+    for item in raw:
+        if isinstance(item, str):
+            label = Path(item).stem  # e.g. "homepage" from "/screenshots/.../homepage.png"
+            result.append({"label": label, "path": item})
+        elif isinstance(item, dict):
+            result.append(item)
+    return result
+
+
 def _serialize_run(run: ScanRun) -> dict:
     return {
         "id": str(run.id),
@@ -456,7 +497,7 @@ def _serialize_run(run: ScanRun) -> dict:
         "platform_mismatch": run.platform_mismatch,
         "pdf_path": run.pdf_path,
         "slinger_drafts": run.slinger_drafts_json,
-        "screenshots": run.screenshots_json,
+        "screenshots": _normalize_screenshots(run.screenshots_json),
         "error_message": run.error_message,
     }
 
