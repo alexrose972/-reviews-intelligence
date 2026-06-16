@@ -197,6 +197,7 @@ async def api_get_scan(scan_id: str, user: dict = Depends(require_auth)):
 
 @app.get("/api/scans/{scan_id}/pdf")
 async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
+    import re as _re
     async with AsyncSessionLocal() as db:
         run = await db.get(ScanRun, scan_id)
     if not run or not run.pdf_path:
@@ -204,9 +205,36 @@ async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
     path = Path(run.pdf_path)
     if not path.exists():
         raise HTTPException(404, "PDF file not found on disk")
-    media = "application/pdf" if str(path).endswith(".pdf") else "text/html"
-    return FileResponse(str(path), media_type=media,
-                        filename=f"{run.brand_name.replace(' ', '_')}_brief{path.suffix}")
+
+    # If WeasyPrint failed at scan time we stored an .html fallback — try converting now
+    if path.suffix != ".pdf":
+        pdf_path = path.with_suffix(".pdf")
+        if pdf_path.exists():
+            path = pdf_path
+        else:
+            try:
+                from weasyprint import HTML as WeasyHTML
+                logger.info("On-demand PDF conversion for scan %s", scan_id)
+                WeasyHTML(filename=str(path)).write_pdf(str(pdf_path))
+                logger.info("On-demand PDF written to %s", pdf_path)
+                # Persist the new path so future downloads are instant
+                async with AsyncSessionLocal() as db2:
+                    run2 = await db2.get(ScanRun, scan_id)
+                    if run2:
+                        run2.pdf_path = str(pdf_path)
+                        await db2.commit()
+                path = pdf_path
+            except Exception as exc:
+                logger.error("On-demand WeasyPrint failed for scan %s: %s", scan_id, exc, exc_info=True)
+                raise HTTPException(500, f"PDF generation failed: {exc}")
+
+    safe = _re.sub(r"[^\w]", "_", run.brand_name)
+    filename = f"{safe}_audit.pdf"
+    return FileResponse(
+        str(path),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/scans/{scan_id}/screenshot/{label}")

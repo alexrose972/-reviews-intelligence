@@ -2,9 +2,10 @@ FROM python:3.11-slim-bookworm
 
 # System dependencies for Playwright, WeasyPrint, fonts, and Node.js
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # WeasyPrint deps
+    # WeasyPrint deps (pango, cairo, harfbuzz, fontconfig must all be present)
     libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
-    libcairo2 libgdk-pixbuf2.0-0 libffi-dev \
+    libcairo2 libcairo-gobject2 libgdk-pixbuf-2.0-0 libffi-dev \
+    libharfbuzz0b libfreetype6 libfontconfig1 shared-mime-info \
     # Playwright deps
     libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
