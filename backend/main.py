@@ -214,9 +214,9 @@ async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
         else:
             try:
                 from weasyprint import HTML as WeasyHTML
-                logger.info("On-demand PDF conversion for scan %s", scan_id)
+                log.info("On-demand PDF conversion for scan %s", scan_id)
                 WeasyHTML(filename=str(path)).write_pdf(str(pdf_path))
-                logger.info("On-demand PDF written to %s", pdf_path)
+                log.info("On-demand PDF written to %s", pdf_path)
                 # Persist the new path so future downloads are instant
                 async with AsyncSessionLocal() as db2:
                     run2 = await db2.get(ScanRun, scan_id)
@@ -225,7 +225,7 @@ async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
                         await db2.commit()
                 path = pdf_path
             except Exception as exc:
-                logger.error("On-demand WeasyPrint failed for scan %s: %s", scan_id, exc, exc_info=True)
+                log.error("On-demand WeasyPrint failed for scan %s: %s", scan_id, exc, exc_info=True)
                 raise HTTPException(500, f"PDF generation failed: {exc}")
 
     safe = _re.sub(r"[^\w]", "_", run.brand_name)
