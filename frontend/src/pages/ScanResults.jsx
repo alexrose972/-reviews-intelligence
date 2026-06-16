@@ -43,7 +43,7 @@ export default function ScanResults() {
     const jobStatus = scan.chrome_job_status
     if (!jobStatus || jobStatus === 'complete' || jobStatus === 'failed' || jobStatus === 'timeout') return
 
-    const poll = setInterval(() => {
+    function loadChromeStatus() {
       fetch(`/api/scans/${id}/chrome-status`, { credentials: 'include' })
         .then(r => r.json())
         .then(d => {
@@ -57,7 +57,9 @@ export default function ScanResults() {
           }
         })
         .catch(() => {})
-    }, 5000)
+    }
+    loadChromeStatus()
+    const poll = setInterval(loadChromeStatus, 5000)
     return () => clearInterval(poll)
   }, [id, scan?.chrome_job_status])
 
@@ -109,7 +111,7 @@ export default function ScanResults() {
           .catch(() => {})
       } else if (msg.type === 'already_complete' || msg.type === 'status') {
         setScan(msg.result)
-        setStatus(msg.result?.status === 'failed' ? 'failed' : 'complete')
+        setStatus(msg.result?.status || 'complete')
       }
     }
 
@@ -215,6 +217,7 @@ export default function ScanResults() {
           <BlockedCard
             scan={scan}
             error={error}
+            chromeStatus={chromeStatus}
             onTrigger={triggerChromeScan}
             triggering={triggeringChrome}
             onRescan={rescan}
@@ -243,6 +246,8 @@ export default function ScanResults() {
         {/* ── Complete state ── */}
         {status === 'complete' && scan && (
           <div className="space-y-6">
+            <EvidencePanel evidence={scan.evidence} onTrigger={triggerChromeScan} triggering={triggeringChrome} />
+
             {/* Score hero */}
             <div className="card p-6">
               <div className="flex flex-col sm:flex-row sm:items-center gap-6">
@@ -388,6 +393,8 @@ export default function ScanResults() {
 // ── Chrome status banner ───────────────────────────────────────────────────────
 
 function ChromeStatusBanner({ jobStatus, brandName, fallbackReason, chromeStatus }) {
+  const runner = chromeStatus?.runner
+  const runnerOffline = (jobStatus === 'queued' || jobStatus === 'running') && runner && !runner.online
   const statusLabel = {
     queued: 'Queued — waiting for Chrome runner',
     running: 'Chrome is auditing in real-time…',
@@ -405,20 +412,28 @@ function ChromeStatusBanner({ jobStatus, brandName, fallbackReason, chromeStatus
   const isActive = jobStatus === 'queued' || jobStatus === 'running'
 
   return (
-    <div className={`mb-6 p-4 rounded-xl border ${isActive ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
+    <div className={`mb-6 p-4 rounded-xl border ${runnerOffline ? 'bg-amber-50 border-amber-200' : isActive ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
       <div className="flex items-center gap-2 mb-1">
         <span className="text-lg">🌐</span>
-        <span className={`font-semibold text-sm ${isActive ? 'text-blue-800' : 'text-amber-800'}`}>
+        <span className={`font-semibold text-sm ${runnerOffline ? 'text-amber-800' : isActive ? 'text-blue-800' : 'text-amber-800'}`}>
           Browser Scan Mode
         </span>
-        {isActive && (
+        {isActive && !runnerOffline && (
           <div className="w-3 h-3 rounded-full bg-blue-500 animate-pulse ml-1" />
         )}
       </div>
-      <p className={`text-sm ${isActive ? 'text-blue-700' : 'text-amber-700'}`}>
+      <p className={`text-sm ${runnerOffline ? 'text-amber-700' : isActive ? 'text-blue-700' : 'text-amber-700'}`}>
         {statusLabel} — <span className="font-medium">{brandName}</span>
         {reasonLabel && <span className="text-xs ml-2 opacity-70">(reason: {reasonLabel})</span>}
       </p>
+      {runnerOffline && (
+        <p className="text-xs text-amber-700 mt-2">
+          No Browser Scan runner is online. Start the local runner, then this job will be picked up automatically.
+        </p>
+      )}
+      {runner?.online && (
+        <p className="text-xs text-blue-600 mt-1">Runner online — last check {runner.seconds_since_seen}s ago.</p>
+      )}
       {chromeStatus?.chrome_pdps_visited > 0 && (
         <p className="text-xs text-blue-600 mt-1">
           {chromeStatus.chrome_pdps_visited} product pages visited
@@ -430,9 +445,10 @@ function ChromeStatusBanner({ jobStatus, brandName, fallbackReason, chromeStatus
 
 // ── Blocked state (bot protection blocked the scanner) ─────────────────────────
 
-function BlockedCard({ scan, error, onTrigger, triggering, onRescan, rescanning, onBack }) {
+function BlockedCard({ scan, error, chromeStatus, onTrigger, triggering, onRescan, rescanning, onBack }) {
   const jobStatus = scan?.chrome_job_status
   const browserPending = jobStatus === 'queued' || jobStatus === 'running'
+  const runnerOffline = browserPending && chromeStatus?.runner && !chromeStatus.runner.online
   const message = error || scan?.error_message ||
     'The live site blocked the scanner. No score was generated.'
 
@@ -448,8 +464,8 @@ function BlockedCard({ scan, error, onTrigger, triggering, onRescan, rescanning,
 
       <div className="flex items-center justify-center gap-2 mt-4">
         {browserPending ? (
-          <span className="text-sm text-blue-600 font-medium">
-            🌐 Browser scan queued — waiting for a runner…
+          <span className={`text-sm font-medium ${runnerOffline ? 'text-amber-700' : 'text-blue-600'}`}>
+            {runnerOffline ? 'Browser scan queued — runner offline' : '🌐 Browser scan queued — waiting for a runner…'}
           </span>
         ) : (
           <button
@@ -467,6 +483,11 @@ function BlockedCard({ scan, error, onTrigger, triggering, onRescan, rescanning,
           Back to Dashboard
         </button>
       </div>
+      {runnerOffline && (
+        <p className="text-xs text-amber-700 mt-3">
+          Start the local Browser Scan runner and this queued scan will continue automatically.
+        </p>
+      )}
     </div>
   )
 }
@@ -498,6 +519,105 @@ function LowConfidencePrompt({ scan, onTrigger, triggering }) {
       >
         {triggering ? 'Queuing…' : '🌐 Run Browser Scan'}
       </button>
+    </div>
+  )
+}
+
+function EvidencePanel({ evidence, onTrigger, triggering }) {
+  if (!evidence) return null
+
+  const theme = {
+    high: {
+      wrap: 'border-green-200 bg-green-50',
+      dot: 'bg-green-500',
+      text: 'text-green-800',
+      label: 'High confidence',
+    },
+    medium: {
+      wrap: 'border-amber-200 bg-amber-50',
+      dot: 'bg-amber-500',
+      text: 'text-amber-800',
+      label: 'Medium confidence',
+    },
+    low: {
+      wrap: 'border-red-200 bg-red-50',
+      dot: 'bg-red-500',
+      text: 'text-red-800',
+      label: 'Low confidence',
+    },
+    pending: {
+      wrap: 'border-blue-200 bg-blue-50',
+      dot: 'bg-blue-500',
+      text: 'text-blue-800',
+      label: 'Verification pending',
+    },
+    blocked: {
+      wrap: 'border-amber-200 bg-amber-50',
+      dot: 'bg-amber-500',
+      text: 'text-amber-800',
+      label: 'Blocked',
+    },
+  }[evidence.level] || {
+    wrap: 'border-gray-200 bg-white',
+    dot: 'bg-gray-400',
+    text: 'text-gray-800',
+    label: 'Evidence',
+  }
+
+  const shouldOfferBrowserScan = evidence.level === 'low' || evidence.level === 'blocked'
+
+  return (
+    <div className={`rounded-xl border p-4 ${theme.wrap}`}>
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className={`w-2.5 h-2.5 rounded-full ${theme.dot}`} />
+            <p className={`text-sm font-semibold ${theme.text}`}>{theme.label}</p>
+          </div>
+          <p className={`text-sm mt-1 leading-relaxed ${theme.text}`}>{evidence.summary}</p>
+          {evidence.next_action && (
+            <p className="text-xs text-gray-600 mt-2">{evidence.next_action}</p>
+          )}
+        </div>
+        <div className={`text-2xl font-black tabular-nums leading-none ${theme.text}`}>
+          {evidence.score}<span className="text-sm font-semibold opacity-60">/100</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
+        <EvidenceList title="Proof found" items={evidence.proof} empty="No proof captured yet." />
+        <EvidenceList title="Gaps to verify" items={evidence.gaps} empty="No major evidence gaps." />
+      </div>
+
+      {shouldOfferBrowserScan && (
+        <button
+          onClick={onTrigger}
+          disabled={triggering}
+          className="btn-primary text-sm py-1.5 px-4 mt-4"
+        >
+          {triggering ? 'Queuing...' : 'Run Browser Scan'}
+        </button>
+      )}
+    </div>
+  )
+}
+
+function EvidenceList({ title, items = [], empty }) {
+  return (
+    <div className="rounded-lg bg-white/70 border border-white/80 p-3">
+      <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">{title}</p>
+      {items.length > 0 ? (
+        <div className="space-y-1.5">
+          {items.map(item => (
+            <div key={item} className="flex items-start gap-2 text-xs text-gray-700">
+              <span className="mt-1 w-1.5 h-1.5 rounded-full bg-gray-400 flex-shrink-0" />
+              <span>{item}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="text-xs text-gray-400">{empty}</p>
+      )}
     </div>
   )
 }

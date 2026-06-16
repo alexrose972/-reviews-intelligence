@@ -283,6 +283,30 @@ async def queue_chrome_job(
     """Create a chrome_jobs row and update the scan. Returns job ID."""
     now = datetime.utcnow()
     async with AsyncSessionLocal() as db:
+        existing_result = await db.execute(
+            select(ChromeJob)
+            .where(
+                ChromeJob.scan_id == UUID(scan_id),
+                ChromeJob.status.in_(("queued", "running")),
+            )
+            .order_by(ChromeJob.created_at.desc())
+            .limit(1)
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing:
+            run = await db.get(ScanRun, scan_id)
+            if run:
+                run.scan_mode = "chrome"
+                run.chrome_job_status = existing.status
+                run.chrome_job_queued_at = run.chrome_job_queued_at or existing.created_at
+                run.scan_fallback_reason = run.scan_fallback_reason or fallback_reason
+            await db.commit()
+            log.info(
+                "Chrome job %s already %s for %s; reusing it",
+                existing.id, existing.status, brand_name,
+            )
+            return str(existing.id)
+
         job = ChromeJob(
             scan_id=UUID(scan_id),
             brand_name=brand_name,

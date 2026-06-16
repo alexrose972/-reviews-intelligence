@@ -506,12 +506,8 @@ async def run_scan(
                             "Could not access product pages — score zeroed to prevent fabrication."
                         )
 
-            # If review text samples were empty across ALL PDPs, richness must be 0
-            all_review_texts = []
-            for entry in audit_log:
-                if entry.get("step", "").startswith("pdp_review_audit_"):
-                    all_review_texts.extend(entry.get("review_texts_found", []) or [])
-            # (review_texts_found is a count, not list — so sum it)
+            # If review text samples were empty across ALL PDPs, richness must be 0.
+            # `review_texts_found` is stored as a count in the audit log.
             total_review_texts = sum(
                 entry.get("review_texts_found", 0)
                 for entry in audit_log

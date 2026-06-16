@@ -311,15 +311,27 @@ export default function Dashboard() {
 }
 
 function ChromeQueuePanel({ queue, onNavigate }) {
+  const runnerOffline = queue.queued?.length > 0 && queue.runner && !queue.runner.online
+
   return (
-    <div className="mb-6 p-4 rounded-xl border border-blue-200 bg-blue-50">
+    <div className={`mb-6 p-4 rounded-xl border ${runnerOffline ? 'border-amber-200 bg-amber-50' : 'border-blue-200 bg-blue-50'}`}>
       <div className="flex items-center gap-2 mb-3">
         <span>🌐</span>
-        <span className="text-sm font-semibold text-blue-800">Chrome Browser Queue</span>
+        <span className={`text-sm font-semibold ${runnerOffline ? 'text-amber-800' : 'text-blue-800'}`}>
+          Chrome Browser Queue
+        </span>
+        {queue.runner?.online && (
+          <span className="text-xs text-blue-600">runner online</span>
+        )}
         {queue.completed_today > 0 && (
-          <span className="ml-auto text-xs text-blue-600">{queue.completed_today} completed today</span>
+          <span className={`ml-auto text-xs ${runnerOffline ? 'text-amber-600' : 'text-blue-600'}`}>{queue.completed_today} completed today</span>
         )}
       </div>
+      {runnerOffline && (
+        <p className="text-sm text-amber-700 mb-2">
+          Browser scans are queued, but no local runner is online.
+        </p>
+      )}
       {queue.running && (
         <div className="flex items-center gap-2 mb-2">
           <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse flex-shrink-0" />

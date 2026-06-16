@@ -115,6 +115,7 @@ export default function History() {
               <option value="complete">Complete</option>
               <option value="running">Running</option>
               <option value="pending">Pending</option>
+              <option value="blocked">Blocked</option>
               <option value="failed">Failed</option>
             </select>
 
@@ -217,12 +218,14 @@ function StatusPill({ status }) {
     complete: 'bg-green-100 text-green-700',
     running:  'bg-yotpo-pale text-yotpo-purple',
     pending:  'bg-yellow-100 text-yellow-700',
+    blocked:  'bg-amber-100 text-amber-700',
     failed:   'bg-red-100 text-red-600',
   }
   const labels = {
     complete: 'Complete',
     running:  'Running',
     pending:  'Pending',
+    blocked:  'Blocked',
     failed:   'Failed',
   }
   return (

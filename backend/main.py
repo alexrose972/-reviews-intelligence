@@ -71,6 +71,18 @@ class WSManager:
                 self.disconnect(scan_id, ws)
 
 ws_manager = WSManager()
+runner_last_seen_at: Optional[datetime] = None
+
+
+def _runner_status() -> dict:
+    if not runner_last_seen_at:
+        return {"online": False, "last_seen_at": None, "seconds_since_seen": None}
+    seconds = max(0, int((datetime.utcnow() - runner_last_seen_at).total_seconds()))
+    return {
+        "online": seconds <= 30,
+        "last_seen_at": _iso(runner_last_seen_at),
+        "seconds_since_seen": seconds,
+    }
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
@@ -315,11 +327,17 @@ async def api_chrome_status(scan_id: str, user: dict = Depends(require_auth)):
         "chrome_error": run.chrome_error,
         "scan_fallback_reason": run.scan_fallback_reason,
         "overall_status": run.status,
+        "runner": _runner_status(),
     }
 
 
 class ChromeFallbackRequest(BaseModel):
     reason: str = "manual"
+
+
+class ChromeJobFailureRequest(BaseModel):
+    error: str = "Browser Scan failed"
+    blocked: bool = False
 
 
 @app.post("/api/scans/{scan_id}/chrome-fallback")
@@ -401,6 +419,7 @@ async def api_chrome_queue(user: dict = Depends(require_auth)):
             for i, j in enumerate(queued_jobs)
         ],
         "completed_today": completed_today,
+        "runner": _runner_status(),
     }
 
 
@@ -416,6 +435,9 @@ async def api_claim_chrome_job(request: Request):
     expected = os.environ.get("BROWSER_WEBHOOK_SECRET", "")
     if not expected or secret != expected:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    global runner_last_seen_at
+    runner_last_seen_at = datetime.utcnow()
 
     now = datetime.utcnow()
     async with AsyncSessionLocal() as db:
@@ -439,11 +461,13 @@ async def api_claim_chrome_job(request: Request):
                 j.status = "queued"
         await db.commit()
 
-        # Claim the next queued job (highest priority, oldest first)
+        # Claim the next queued job (highest priority, oldest first). Row locking
+        # prevents two local runners from claiming the same Browser Scan.
         result = await db.execute(
             select(ChromeJob)
             .where(ChromeJob.status == "queued")
             .order_by(ChromeJob.priority.desc(), ChromeJob.created_at.asc())
+            .with_for_update(skip_locked=True)
             .limit(1)
         )
         job = result.scalar_one_or_none()
@@ -468,6 +492,34 @@ async def api_claim_chrome_job(request: Request):
             "base_url": job.base_url,
             "attempts": job.attempts,
         }}
+
+
+@app.post("/api/chrome-jobs/{job_id}/fail")
+async def api_fail_chrome_job(job_id: str, body: ChromeJobFailureRequest, request: Request):
+    """Mark a Browser Scan job failed immediately instead of waiting for timeout."""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    expected = os.environ.get("BROWSER_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    now = datetime.utcnow()
+    async with AsyncSessionLocal() as db:
+        job = await db.get(ChromeJob, job_id)
+        if not job:
+            raise HTTPException(404, "Chrome job not found")
+        job.status = "failed"
+        job.error = body.error[:1000]
+        job.completed_at = now
+        run = await db.get(ScanRun, job.scan_id)
+        if run:
+            run.chrome_job_status = "failed"
+            run.chrome_error = body.error[:1000]
+            run.chrome_job_completed_at = now
+            if body.blocked and run.status != "complete":
+                run.status = "blocked"
+                run.error_message = body.error[:1000]
+        await db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/browser-data/{scan_id}")
@@ -835,12 +887,16 @@ async def api_export_history(user: dict = Depends(require_auth)):
 
 @app.websocket("/ws/scans/{scan_id}")
 async def ws_scan(scan_id: str, ws: WebSocket):
+    if not ws.session.get("user"):
+        await ws.close(code=1008)
+        return
+
     await ws_manager.connect(scan_id, ws)
     try:
         # If scan already complete, send current state immediately
         async with AsyncSessionLocal() as db:
             run = await db.get(ScanRun, scan_id)
-        if run and run.status in ("complete", "failed"):
+        if run and run.status in ("complete", "failed", "blocked"):
             await ws.send_json({"type": "status", "status": run.status, "result": _serialize_run(run)})
         # Keep connection alive until client disconnects
         while True:
@@ -907,6 +963,123 @@ def _normalize_screenshots(raw) -> list:
     return result
 
 
+def _scan_evidence(run: ScanRun) -> dict:
+    """Build the trust layer the UI uses to explain whether a scan is usable."""
+    audit_log = run.audit_log_json or []
+    scores = run.scores_json or {}
+    screenshots = _normalize_screenshots(run.screenshots_json)
+    chrome_raw = run.chrome_raw_data or {}
+
+    pdps_found = len((chrome_raw.get("pdps_visited") or [])) if isinstance(chrome_raw, dict) else 0
+    pdps_rendered = pdps_found
+    reviews_found = 0
+    schema_found = False
+    category_stars = False
+
+    if isinstance(chrome_raw, dict):
+        for pdp in chrome_raw.get("pdps_visited") or []:
+            reviews_found += len(pdp.get("reviews") or [])
+            schema_found = schema_found or bool(
+                pdp.get("has_review_schema") or pdp.get("has_aggregate_rating_schema")
+            )
+        category_stars = bool((chrome_raw.get("category_page") or {}).get("has_stars_on_cards"))
+
+    for entry in audit_log:
+        step = entry.get("step", "")
+        if step == "pdp_discovery_result":
+            pdps_found = max(pdps_found, int(entry.get("urls_found") or 0))
+        elif step == "pdp_phase_complete":
+            pdps_rendered = max(pdps_rendered, int(entry.get("pdps_rendered") or 0))
+        elif step.startswith("pdp_review_audit_"):
+            reviews_found += int(entry.get("review_texts_found") or 0)
+        elif step == "chrome_data_received":
+            pdps_rendered = max(pdps_rendered, int(entry.get("pdps_visited") or 0))
+            reviews_found = max(reviews_found, int(entry.get("reviews_found") or 0))
+
+    for value in scores.values():
+        finding = (value or {}).get("finding", "").lower()
+        schema_found = schema_found or "schema" in finding and "no " not in finding[:12]
+        category_stars = category_stars or "category" in finding and "star" in finding and "no " not in finding[:12]
+
+    score = 25
+    if run.scan_mode == "chrome":
+        score += 30
+    if pdps_found:
+        score += 12
+    if pdps_rendered:
+        score += 12
+    if reviews_found:
+        score += 18
+    if screenshots:
+        score += 8
+    if schema_found:
+        score += 5
+
+    zero_count = sum(
+        1
+        for key, value in scores.items()
+        if key != "llm_crawlability" and (value or {}).get("score") == 0
+    )
+    if run.status == "blocked":
+        score = 0
+        level = "blocked"
+        summary = "The site blocked the scanner. Do not use the score until Browser Scan succeeds."
+    elif run.chrome_job_status in ("queued", "running"):
+        score = 45
+        level = "pending"
+        summary = "Browser verification is queued or running. Treat the current score as provisional."
+    else:
+        score = max(0, min(100, score - min(25, zero_count * 5)))
+        if score >= 80:
+            level = "high"
+            summary = "Strong evidence: the score is backed by rendered PDPs, reviews, and screenshots."
+        elif score >= 55:
+            level = "medium"
+            summary = "Usable brief, but a Browser Scan or more review evidence would strengthen it."
+        else:
+            level = "low"
+            summary = "Low confidence: the scan found limited evidence, so verify before outreach."
+
+    proof = [
+        f"{pdps_found} product pages discovered",
+        f"{pdps_rendered} product pages rendered",
+        f"{reviews_found} review texts extracted",
+        f"{len(screenshots)} screenshots captured",
+    ]
+    if schema_found:
+        proof.append("Review schema evidence found")
+    if category_stars:
+        proof.append("Category-page star signal found")
+
+    gaps = []
+    if pdps_found == 0:
+        gaps.append("No PDPs discovered")
+    if reviews_found == 0:
+        gaps.append("No review text extracted")
+    if not screenshots:
+        gaps.append("No screenshots captured")
+    if not schema_found:
+        gaps.append("No review schema evidence")
+    if not category_stars:
+        gaps.append("No category star evidence")
+
+    if level in {"blocked", "low", "pending"}:
+        action = "Run or wait for Browser Scan before using this account brief."
+    elif run.platform_mismatch:
+        action = "Lead with the platform mismatch, then use the weakest dimensions as proof."
+    else:
+        action = "Use the top pitch angles and screenshots as the outreach spine."
+
+    return {
+        "level": level,
+        "score": score,
+        "summary": summary,
+        "proof": proof,
+        "gaps": gaps[:5],
+        "next_action": action,
+    }
+
+
 def _serialize_run(run: ScanRun) -> dict:
     return {
         "id": str(run.id),
@@ -933,6 +1106,7 @@ def _serialize_run(run: ScanRun) -> dict:
         "chrome_job_status": run.chrome_job_status,
         "scan_fallback_reason": run.scan_fallback_reason,
         "chrome_pdps_visited": run.chrome_pdps_visited or 0,
+        "evidence": _scan_evidence(run),
     }
 
 

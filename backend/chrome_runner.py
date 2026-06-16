@@ -44,6 +44,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -70,6 +71,10 @@ PSI_KEY = os.environ.get("GOOGLE_PAGESPEED_API_KEY", "")
 POLL = int(os.environ.get("RUNNER_POLL_SECONDS", "8"))
 
 
+class BrowserScanBlocked(RuntimeError):
+    """The real browser still received a block/challenge page."""
+
+
 def _b64_file(path: str) -> str:
     try:
         return base64.b64encode(Path(path).read_bytes()).decode()
@@ -82,6 +87,11 @@ def _vertical_signals_found(vertical: str, text: str) -> list:
         return []
     low = text.lower()
     return [s for s in VERTICAL_SIGNALS_MAP.get(vertical, []) if s in low][:6]
+
+
+def _product_name_from_url(url: str) -> str:
+    slug = urlparse(url).path.rstrip("/").split("/")[-1]
+    return unquote(slug).replace("-", " ").replace("_", " ").strip().title()
 
 
 async def claim_job(api: httpx.AsyncClient) -> dict | None:
@@ -100,6 +110,21 @@ async def post_results(api: httpx.AsyncClient, scan_id: str, payload: dict):
         headers={"X-Webhook-Secret": SECRET},
     )
     r.raise_for_status()
+
+
+async def report_failure(api: httpx.AsyncClient, job: dict, error: str, blocked: bool = False):
+    job_id = job.get("id")
+    if not job_id:
+        return
+    try:
+        r = await api.post(
+            f"{API_BASE}/api/chrome-jobs/{job_id}/fail",
+            json={"error": error, "blocked": blocked},
+            headers={"X-Webhook-Secret": SECRET},
+        )
+        r.raise_for_status()
+    except Exception as exc:
+        log.warning("Could not report Browser Scan failure for job %s: %s", job_id, exc)
 
 
 async def fetch_page_speed(url: str) -> dict:
@@ -137,6 +162,7 @@ async def audit(job: dict) -> dict:
     auditor_kwargs = {"cdp_url": CDP_URL} if CDP_URL else {"real_chrome": True}
 
     pdps: list[dict] = []
+    bestsellers: list[dict] = []
     homepage_html = ""
     cat_url = ""
     cat_html = ""
@@ -148,9 +174,7 @@ async def audit(job: dict) -> dict:
 
         block = detect_block(homepage_html)
         if block:
-            # Even a real browser can hit a challenge — surface it honestly
-            # rather than scoring a block page.
-            log.warning("Real browser also blocked for %s (%s)", brand, block)
+            raise BrowserScanBlocked(f"Real browser also hit bot protection: {block}")
 
         for i, url in enumerate(pdp_urls[:5]):
             html, rd = await auditor.get_pdp_with_reviews(url)
@@ -168,6 +192,7 @@ async def audit(job: dict) -> dict:
                 })
             pdps.append({
                 "url": url,
+                "product_name": _product_name_from_url(url),
                 "reviews": reviews,
                 "total_review_count": rd.get("review_count"),
                 "has_ai_summary": bool(rd.get("has_ai_summary")),
@@ -176,6 +201,15 @@ async def audit(job: dict) -> dict:
                 "has_aggregate_rating_schema": has_aggregate_rating(jsonld),
                 "review_platform_detected": detect_platform(html) or "",
                 "screenshot_base64": "",
+            })
+
+        for pdp in pdps[:5]:
+            count = pdp.get("total_review_count")
+            bestsellers.append({
+                "url": pdp["url"],
+                "product_name": pdp.get("product_name") or _product_name_from_url(pdp["url"]),
+                "review_count": count,
+                "has_50_plus": bool(count is not None and count >= 50),
             })
 
         cat_url, cat_html = await auditor.get_category_html(base_url)
@@ -189,7 +223,6 @@ async def audit(job: dict) -> dict:
         pdps[0]["screenshot_base64"] = shot_b64.get("pdp_reviews", "")
     if len(pdps) > 1:
         pdps[1]["screenshot_base64"] = shot_b64.get("pdp_above_fold", "")
-        pdps[1]["stars_above_fold"] = True
 
     # ── Roll-ups ──────────────────────────────────────────────────────────────
     platform = detect_platform(homepage_html) or (
@@ -209,6 +242,8 @@ async def audit(job: dict) -> dict:
     notes = [f"Browser Scan via {mode_label} on a residential IP."]
     if not pdps:
         notes.append("No product pages reachable even from a real browser.")
+    if bestsellers:
+        notes.append("Bestseller depth uses the first discovered top-product pages from the local browser audit.")
 
     return {
         "scan_id": scan_id,
@@ -222,7 +257,7 @@ async def audit(job: dict) -> dict:
             "has_stars_on_cards": cat_stars,
             "screenshot_base64": shot_b64.get("category_stars", ""),
         },
-        "bestsellers": [],
+        "bestsellers": bestsellers,
         "homepage": {
             "detected_platform": platform,
             "has_nav_review_link": nav_link,
@@ -275,10 +310,14 @@ async def main():
                     len(payload["pdps_visited"]),
                     sum(len(p["reviews"]) for p in payload["pdps_visited"]),
                 )
+            except BrowserScanBlocked as exc:
+                message = str(exc)
+                log.error("Browser Scan blocked for %s: %s", job.get("brand"), message)
+                await report_failure(api, job, message, blocked=True)
+                await asyncio.sleep(POLL)
             except Exception as exc:
                 log.error("Audit failed for %s: %s", job.get("brand"), exc, exc_info=True)
-                # Leave the job 'running'; the server requeues it on timeout
-                # (or marks it failed once max attempts are exhausted).
+                await report_failure(api, job, str(exc), blocked=False)
                 await asyncio.sleep(POLL)
 
 
