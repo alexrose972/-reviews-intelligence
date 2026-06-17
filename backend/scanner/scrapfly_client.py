@@ -11,6 +11,8 @@ otherwise. Implements the same method surface the engine calls on the auditor:
     find_pdp_urls, get_html, get_pdp_with_reviews, get_category_html, take_screenshots
 """
 
+import base64
+import json
 import logging
 import os
 import re
@@ -26,6 +28,30 @@ from .browser import PDP_PATH_RE, SHOP_PATH_RE, BESTSELLER_KEYWORDS, SS_BASE
 log = logging.getLogger("scanner.scrapfly")
 
 API = "https://api.scrapfly.io/scrape"
+
+# JS run before screenshots: close/remove cookie banners, email-capture modals,
+# and full-screen fixed overlays so the shot shows the real page, not a popup.
+_POPUP_KILL_JS = (
+    '(function(){try{'
+    'document.querySelectorAll(\'[aria-label*="close" i],button[class*="close" i],'
+    '[class*="popup"] [class*="close" i],[class*="modal"] [class*="close" i]\')'
+    '.forEach(function(b){try{b.click()}catch(e){}});'
+    '[\'[class*="popup" i]\',\'[class*="modal" i]\',\'[class*="overlay" i]\',\'[class*="newsletter" i]\','
+    '\'[class*="klaviyo" i]\',\'[class*="privy" i]\',\'[class*="attentive" i]\',\'[id*="popup" i]\','
+    '\'[role="dialog"]\',\'[aria-modal="true"]\',\'dialog\']'
+    '.forEach(function(s){document.querySelectorAll(s).forEach(function(e){try{e.remove()}catch(_){}})});'
+    'Array.prototype.slice.call(document.querySelectorAll("body *")).forEach(function(e){try{'
+    'var st=getComputedStyle(e);if(st.position==="fixed"&&parseInt(st.zIndex||0)>=40){'
+    'var r=e.getBoundingClientRect();if(r.width>window.innerWidth*0.55&&r.height>window.innerHeight*0.45)e.remove();}}catch(_){}});'
+    'document.documentElement.style.overflow="auto";document.body.style.overflow="auto";'
+    '}catch(e){}})();'
+)
+
+
+def _popup_kill_scenario() -> str:
+    """Base64 js_scenario: wait for late popups, remove them, settle, then shoot."""
+    steps = [{"wait": 3000}, {"execute": {"script": _POPUP_KILL_JS}}, {"wait": 700}]
+    return base64.b64encode(json.dumps(steps).encode()).decode()
 
 
 def _key() -> str:
@@ -54,6 +80,7 @@ async def scrapfly_scrape(
         params["rendering_wait"] = str(wait_ms)
     if screenshot:
         params["screenshots[main]"] = "fullpage"
+        params["js_scenario"] = _popup_kill_scenario()  # no popups in the shot
 
     try:
         r = await client.get(API, params=params, timeout=150)

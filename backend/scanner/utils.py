@@ -2,7 +2,7 @@
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -237,13 +237,36 @@ def extract_review_dates(soup: BeautifulSoup) -> List[str]:
     return dates
 
 
+_REL_UNIT_DAYS = {"day": 1, "week": 7, "month": 30, "year": 365}
+
+
 def parse_date(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    # Absolute formats
     for fmt in ["%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%d/%m/%Y",
                 "%m/%d/%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"]:
         try:
             return datetime.strptime(s[:20], fmt)
         except Exception:
             pass
+    # Relative formats (review widgets: Junip/Yotpo/Okendo show "2 hours ago", etc.)
+    low = s.lower()
+    now = datetime.utcnow()
+    if "just now" in low or "moments ago" in low or "today" in low:
+        return now
+    if "yesterday" in low:
+        return now - timedelta(days=1)
+    m = re.search(r"(\d+)\s*(second|minute|hour)s?\s*ago", low)
+    if m:
+        return now  # same-day → treat as today (fresh)
+    m = re.search(r"(\d+)\s*(day|week|month|year)s?\s*ago", low)
+    if m:
+        return now - timedelta(days=int(m.group(1)) * _REL_UNIT_DAYS[m.group(2)])
+    m = re.search(r"\b(?:a|an|one)\s*(day|week|month|year)\s*ago", low)
+    if m:
+        return now - timedelta(days=_REL_UNIT_DAYS[m.group(1)])
     return None
 
 

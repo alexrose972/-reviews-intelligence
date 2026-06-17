@@ -30,18 +30,20 @@ async def score(
         lcp    = audits.get("largest-contentful-paint", {}).get("displayValue", "")
         fcp    = audits.get("first-contentful-paint", {}).get("displayValue", "")
         tbt    = audits.get("total-blocking-time", {}).get("displayValue", "")
-    except Exception as e:
+    except Exception:
         return {
             "score": round(MAX_PTS * 0.5, 1),
             "max_score": MAX_PTS,
-            "finding": f"PageSpeed API unavailable ({e}). Score estimated.",
+            "finding": "Page speed not measured (set GOOGLE_PAGESPEED_API_KEY for a live mobile score).",
             "perf_score": None, "lcp": "", "fcp": "", "tbt": "",
         }
 
     if perf is None:
+        # Unmeasured (no key / quota). Don't fabricate a low score — neutral
+        # placeholder, clearly flagged, and the pitch must not claim "slow".
         return {
-            "score": 0, "max_score": MAX_PTS,
-            "finding": "PageSpeed API returned no performance score.",
+            "score": round(MAX_PTS * 0.5, 1), "max_score": MAX_PTS,
+            "finding": "Page speed not measured (set GOOGLE_PAGESPEED_API_KEY for a live mobile score).",
             "perf_score": None, "lcp": "", "fcp": "", "tbt": "",
         }
 

@@ -1,105 +1,81 @@
-"""Dimension 1: LLM Crawlability — 20pts."""
+"""Dimension 1: LLM Crawlability / AEO — 20pts.
 
-import os
+Measures whether an AI assistant or search crawler can actually READ the brand's
+reviews from the page: structured data (AggregateRating / Review JSON-LD) plus
+review text present in the rendered HTML (not locked behind a JS-only widget).
+
+We deliberately do NOT ask a no-web-tool model to "quote a review" — it always
+refuses ("I can't browse the internet"), which measures the probe, not the site.
+"""
+
 from typing import Optional
 
-import anthropic
-
-from ..utils import SCORE_WEIGHTS, clean_domain, extract_jsonld, has_aggregate_rating, has_review_schema
+from ..utils import (
+    SCORE_WEIGHTS, clean_domain, extract_jsonld,
+    has_aggregate_rating, has_review_schema, extract_review_texts,
+)
+from bs4 import BeautifulSoup
 
 MAX_PTS = SCORE_WEIGHTS["llm_crawlability"]
 
-VAGUE_SIGNALS = [
-    "i cannot", "i can't", "i don't have", "unable to access", "i'm not able",
-    "as an ai", "no access", "cannot browse", "don't have real-time", "can't browse",
-    "i apologize", "i'm unable", "not able to access",
-]
 
+async def score(domain_url: str, rendered_html: str, skip_llm: bool = False) -> dict:
+    html = rendered_html or ""
+    jsonld = extract_jsonld(html) if html else []
+    has_agg = has_aggregate_rating(jsonld)
+    has_rev = has_review_schema(jsonld)
 
-async def score(
-    domain_url: str,
-    rendered_html: str,        # Playwright-rendered HTML (includes JS-injected schema)
-    skip_llm: bool = False,
-) -> dict:
-    """
-    Two sub-signals:
-      A. LLM probe — ask Claude to quote a review. If it can't, reviews aren't crawlable.
-      B. Schema markup — AggregateRating / Review JSON-LD in the rendered DOM.
-    """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    n_texts = 0
+    if html:
+        try:
+            n_texts = len(extract_review_texts(BeautifulSoup(html, "lxml")))
+        except Exception:
+            n_texts = 0
 
-    # Extract schema from JS-rendered HTML (catches schema injected via JS)
-    jsonld = extract_jsonld(rendered_html) if rendered_html else []
-    has_schema = has_aggregate_rating(jsonld) or has_review_schema(jsonld)
-
-    if skip_llm or not api_key:
-        pts = (MAX_PTS * 0.5) + (6 if has_schema else 0)
-        return {
-            "score": round(min(pts, MAX_PTS), 1),
-            "max_score": MAX_PTS,
-            "finding": "LLM probe skipped. Schema: " + ("present." if has_schema else "missing."),
-            "review_quote": "",
-            "complaint_quote": "",
-            "failed": False,
-        }
-
-    aclient = anthropic.Anthropic(api_key=api_key)
-    quote_response = ""
-    complaint_response = ""
-    llm_failed = False
     pts = 0.0
+    if has_agg:
+        pts += 8
+    if has_rev:
+        pts += 6
+    if n_texts >= 5:
+        pts += 6
+    elif n_texts >= 1:
+        pts += 3
 
-    try:
-        msg1 = aclient.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            messages=[{"role": "user", "content": (
-                f"Please quote the exact text of the first customer review on {domain_url} "
-                "for their best-selling product. Copy the review word-for-word."
-            )}],
+    pts = round(min(pts, MAX_PTS), 1)
+    dom = clean_domain(domain_url)
+
+    have, missing = [], []
+    (have if has_agg else missing).append("AggregateRating schema")
+    (have if has_rev else missing).append("Review schema")
+    (have if n_texts else missing).append("review text in page HTML")
+
+    if pts >= 14:
+        finding = (
+            f"Reviews on {dom} are machine-readable ("
+            + ", ".join(have) + f"; {n_texts} review snippets in the HTML). "
+            "ChatGPT, Perplexity, Gemini and Google rich results can read them."
         )
-        quote_response = msg1.content[0].text.strip()
-        quote_failed = any(s in quote_response.lower() for s in VAGUE_SIGNALS)
-
-        msg2 = aclient.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            messages=[{"role": "user", "content": (
-                f"What is the most common complaint customers mention in reviews on "
-                f"{domain_url}? Be specific. Name the actual complaint."
-            )}],
+    elif pts >= 6:
+        finding = (
+            f"Partial AI crawlability on {dom}: has " + ", ".join(have)
+            + (". Missing " + ", ".join(missing) if missing else ".")
+            + " Adding the rest makes reviews fully readable by AI and Google."
         )
-        complaint_response = msg2.content[0].text.strip()
-        complaint_vague = any(s in complaint_response.lower() for s in VAGUE_SIGNALS)
-
-        if not quote_failed:
-            pts += 8
-        if not complaint_vague:
-            pts += 6
-        if has_schema:
-            pts += 6
-
-        if quote_failed and complaint_vague:
-            llm_failed = True
-            finding = (
-                f"Claude cannot read reviews on {clean_domain(domain_url)}. "
-                f"Response: \"{quote_response[:120]}...\""
-            )
-        else:
-            finding = (
-                f"Claude {'can' if not quote_failed else 'cannot'} quote reviews. "
-                f"Schema: {'present' if has_schema else 'missing'}."
-            )
-    except Exception as e:
-        pts = MAX_PTS * 0.4
-        llm_failed = True
-        finding = f"LLM probe error: {e}"
+    else:
+        finding = (
+            f"Reviews on {dom} are not machine-readable (missing "
+            + ", ".join(missing) + "). They're effectively invisible to "
+            "ChatGPT, Perplexity, Gemini, and Google rich results."
+        )
 
     return {
-        "score": round(min(pts, MAX_PTS), 1),
+        "score": pts,
         "max_score": MAX_PTS,
         "finding": finding,
-        "review_quote": quote_response,
-        "complaint_quote": complaint_response,
-        "failed": llm_failed,
+        "review_quote": "",      # kept for downstream compatibility — never a refusal
+        "complaint_quote": "",
+        "failed": False,
+        "has_schema": has_agg or has_rev,
+        "review_texts_in_html": n_texts,
     }

@@ -91,6 +91,7 @@ def build_pitch_angles(
     vertical: Optional[str],
     vertical_play: str,
     merch_flags: Optional[List[str]] = None,
+    page_speed_score: Optional[float] = None,
 ) -> List[str]:
     angles = []
 
@@ -111,22 +112,25 @@ def build_pitch_angles(
             f"That's what every AI assistant sees when shoppers ask for recommendations."
         )
 
-    ps_dim = scores.get("page_speed", {})
-    if ps_dim.get("score", SCORE_WEIGHTS["page_speed"]) < 6:
+    # Page speed: only claim "slow" when we actually MEASURED a low score —
+    # never when it was unmeasured (no PageSpeed key), which would fabricate.
+    if isinstance(page_speed_score, (int, float)) and page_speed_score < 50:
         platform_note = (
             f" (your {detected_platform} widget is part of this)"
             if detected_platform in {"BazaarVoice", "PowerReviews"} else ""
         )
         angles.append(
-            f"{brand_name}'s mobile performance score is low{platform_note}. "
-            f"At 100ms of delay per 1% conversion loss, that adds up fast on mobile."
+            f"{brand_name}'s mobile performance score is {int(page_speed_score)}/100{platform_note}. "
+            f"At ~1% conversion lost per 100ms, that adds up fast on mobile."
         )
 
+    # Recency: use the dimension's real finding, no hardcoded day count.
     rec_dim = scores.get("review_recency", {})
-    if rec_dim.get("score", 99) < 8:
+    rec_finding = rec_dim.get("finding", "")
+    if rec_dim.get("score", 99) < 8 and "not measured" not in rec_finding and "Could not" not in rec_finding:
         angles.append(
-            f"The most recent visible review on {brand_name} appears to be 90+ days old. "
-            f"60% of shoppers won't buy if the newest review is that stale."
+            f"On {brand_name}, {rec_finding[0].lower() + rec_finding[1:]} "
+            f"60% of shoppers won't buy when the newest review is stale."
         )
 
     rs_dim = scores.get("rich_snippets", {})
@@ -604,7 +608,7 @@ async def run_scan(
         pitch_angles = build_pitch_angles(
             brand_name, all_scores, detected_platform, sf_reviews_provider,
             platform_mismatch, llm_review_quote, llm_failed, vertical, vertical_play,
-            merch_flags=merch.get("flags"),
+            merch_flags=merch.get("flags"), page_speed_score=page_speed_score,
         )
 
         recommendations = [

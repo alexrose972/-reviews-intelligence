@@ -26,7 +26,7 @@ def score(pdp_htmls: List[str]) -> dict:
         }
 
     most_recent = max(all_dates)
-    days_old = (now - most_recent).days
+    days_old = max(0, (now - most_recent).days)
 
     if days_old <= 30:
         pts, label = MAX_PTS, "very fresh"
