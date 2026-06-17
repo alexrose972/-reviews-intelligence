@@ -355,9 +355,11 @@ async def run_scan(
                         run.audit_log_json = audit_log
                         await db.commit()
 
-                # Hand off to the Browser Scan queue (consumed by the local
-                # runner — see PR #2). Honest 'queued' state, no fake score.
-                if os.environ.get("CHROME_AUTO_FALLBACK", "true").lower() == "true":
+                # Hand off to the local-Chrome Browser Scan queue ONLY when
+                # Scrapfly isn't configured. With Scrapfly, it's already the
+                # unblocker — queuing a local runner nobody runs just confuses.
+                if (os.environ.get("CHROME_AUTO_FALLBACK", "true").lower() == "true"
+                        and not os.environ.get("SCRAPFLY_KEY", "").strip()):
                     await queue_chrome_job(
                         scan_id=scan_id, brand_name=brand_name, domain=domain,
                         base_url=base_url, fallback_reason=block_reason,
@@ -489,6 +491,7 @@ async def run_scan(
                 )
             all_scores["page_speed"] = {
                 "score": ps["score"], "max_score": ps["max_score"], "finding": ps["finding"],
+                "measured": ps.get("measured", True),
             }
             page_speed_score = ps.get("perf_score")
             page_speed_lcp = ps.get("lcp", "")
@@ -559,21 +562,21 @@ async def run_scan(
             if reviews_exist:
                 rr = all_scores.get("review_richness")
                 if rr and rr.get("score", 0) == 0:
-                    rr["score"] = round(SCORE_WEIGHTS["review_richness"] * 0.5, 1)
+                    rr["measured"] = False  # don't fake a number for what we couldn't read
                     rr["finding"] = (
                         "Review content loads via the on-site widget and isn't embedded in the page "
                         "HTML, so depth couldn't be measured from the page."
                     )
-                    _log("score_validation", dimension="review_richness", action="neutralized",
+                    _log("score_validation", dimension="review_richness", action="not_measured",
                          reason="reviews_exist_text_not_in_html")
                 rc = all_scores.get("review_recency")
                 if rc and "could not extract" in (rc.get("finding", "") or "").lower():
-                    rc["score"] = round(SCORE_WEIGHTS["review_recency"] * 0.5, 1)
+                    rc["measured"] = False
                     rc["finding"] = (
                         "Review dates load via the on-site widget and aren't embedded in the page "
                         "HTML, so freshness couldn't be measured from the page."
                     )
-                    _log("score_validation", dimension="review_recency", action="neutralized",
+                    _log("score_validation", dimension="review_recency", action="not_measured",
                          reason="reviews_exist_dates_not_in_html")
 
             _log("score_validation_complete",
@@ -592,7 +595,12 @@ async def run_scan(
                 await emit("screenshots", "complete", message="Screenshots skipped.", count=0)
 
         # ── Compute totals (outside Playwright context) ───────────────────────
-        total = round(sum(d["score"] for d in all_scores.values()), 1)
+        # Only count dimensions we could actually measure — never fabricate a
+        # number for what we couldn't see (e.g. page speed without a key, or
+        # reviews that load via a widget). The score rescales to what's measured.
+        _measured = [d for d in all_scores.values() if d.get("measured", True)]
+        _m_max = sum(d.get("max_score", 0) for d in _measured) or 1
+        total = round(sum(d["score"] for d in _measured) / _m_max * 100, 1)
         grade = compute_grade(total)
         platform_mismatch = bool(
             detected_platform and sf_reviews_provider and
@@ -639,7 +647,7 @@ async def run_scan(
         recommendations = [
             f"[{DIMENSION_LABELS.get(k, k)}] {v.get('finding', '')} — {WHY_IT_MATTERS.get(k, '')}"
             for k, v in sorted(
-                all_scores.items(),
+                [(k, v) for k, v in all_scores.items() if v.get("measured", True)],
                 key=lambda x: x[1].get("score", 0) / max(x[1].get("max_score", 1), 1)
             )[:5]
         ]
@@ -749,8 +757,11 @@ async def run_scan(
         await _broadcast(broadcast, scan_id, {"type": "complete", "result": full_result})
         log.info("Scan %s complete: %s/100 grade %s", scan_id, total, grade)
 
-        # ── Auto Chrome fallback ──────────────────────────────────────────────
-        if os.environ.get("CHROME_AUTO_FALLBACK", "true").lower() == "true":
+        # ── Auto Chrome fallback (legacy local-runner path) ───────────────────
+        # Skip entirely when Scrapfly is on — it already handled rendering/unblock,
+        # so a "waiting for Chrome runner" job is pointless and confusing.
+        if (os.environ.get("CHROME_AUTO_FALLBACK", "true").lower() == "true"
+                and not os.environ.get("SCRAPFLY_KEY", "").strip()):
             fallback, reason = _should_fallback_to_chrome(pdp_urls, pdp_htmls, all_scores, audit_log)
             if fallback:
                 log.info("Queuing Chrome fallback for %s: %s", brand_name, reason)

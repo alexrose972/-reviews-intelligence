@@ -71,14 +71,14 @@ def _screenshot_scenario() -> str:
     """Base64 js_scenario for screenshots: clear popups, force lazy images to
     load, scroll through to trigger any remaining lazy loaders, then settle."""
     steps = [
-        {"wait": 2500},
+        {"wait": 4000},
         {"execute": {"script": _POPUP_KILL_JS}},
         {"execute": {"script": _LAZY_IMG_JS}},
         {"scroll": {"x": 0, "y": 9999}},
-        {"wait": 1500},
-        {"scroll": {"x": 0, "y": 0}},
+        {"wait": 3500},
         {"execute": {"script": _LAZY_IMG_JS}},
-        {"wait": 2500},
+        {"scroll": {"x": 0, "y": 0}},
+        {"wait": 4000},
     ]
     return base64.b64encode(json.dumps(steps).encode()).decode()
 
@@ -110,6 +110,7 @@ async def scrapfly_scrape(
     if screenshot:
         params["screenshots[main]"] = "fullpage"
         params["auto_scroll"] = "true"  # trigger intersection-observer lazy loaders
+        params["rendering_wait"] = "5000"  # let the page settle before capture
         params["js_scenario"] = _screenshot_scenario()  # popups gone + images loaded
 
     try:

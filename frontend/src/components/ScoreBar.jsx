@@ -44,6 +44,7 @@ export default function ScoreBar({ scores = {} }) {
         const score = dim.score ?? 0
         const max = dim.max_score ?? SCORE_WEIGHTS[key] ?? 1
         const pct = Math.round((score / max) * 100)
+        const measured = dim.measured !== false
         const label = DIMENSION_LABELS[key]
         const why = WHY_IT_MATTERS[key]
         const finding = dim.finding || ''
@@ -62,15 +63,21 @@ export default function ScoreBar({ scores = {} }) {
             {/* Bar + finding */}
             <div>
               <div className="flex items-center gap-2 mb-1">
-                <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
-                  <div
-                    className={`h-full rounded-full transition-all duration-700 ${barColor(pct)}`}
-                    style={{ width: `${pct}%` }}
-                  />
-                </div>
-                <span className="text-xs font-semibold text-gray-600 w-12 text-right tabular-nums">
-                  {score}/{max}
-                </span>
+                {measured ? (
+                  <>
+                    <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all duration-700 ${barColor(pct)}`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <span className="text-xs font-semibold text-gray-600 w-12 text-right tabular-nums">
+                      {score}/{max}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-xs font-medium text-gray-400 italic">Not measured</span>
+                )}
               </div>
               {finding && (
                 <p className="text-xs text-gray-500 leading-relaxed">{finding}</p>

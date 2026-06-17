@@ -31,19 +31,18 @@ async def score(
         fcp    = audits.get("first-contentful-paint", {}).get("displayValue", "")
         tbt    = audits.get("total-blocking-time", {}).get("displayValue", "")
     except Exception:
+        # Unmeasured — flagged so the engine excludes it from the score rather
+        # than fabricating a number. (Set GOOGLE_PAGESPEED_API_KEY to enable it.)
         return {
-            "score": round(MAX_PTS * 0.5, 1),
-            "max_score": MAX_PTS,
-            "finding": "Page speed not measured (set GOOGLE_PAGESPEED_API_KEY for a live mobile score).",
+            "score": 0, "max_score": MAX_PTS, "measured": False,
+            "finding": "Not measured.",
             "perf_score": None, "lcp": "", "fcp": "", "tbt": "",
         }
 
     if perf is None:
-        # Unmeasured (no key / quota). Don't fabricate a low score — neutral
-        # placeholder, clearly flagged, and the pitch must not claim "slow".
         return {
-            "score": round(MAX_PTS * 0.5, 1), "max_score": MAX_PTS,
-            "finding": "Page speed not measured (set GOOGLE_PAGESPEED_API_KEY for a live mobile score).",
+            "score": 0, "max_score": MAX_PTS, "measured": False,
+            "finding": "Not measured.",
             "perf_score": None, "lcp": "", "fcp": "", "tbt": "",
         }
 
@@ -65,6 +64,7 @@ async def score(
     return {
         "score": round(min(pts, MAX_PTS), 1),
         "max_score": MAX_PTS,
+        "measured": True,
         "finding": " ".join(notes),
         "perf_score": round(pct, 1),
         "lcp": lcp, "fcp": fcp, "tbt": tbt,

@@ -32,9 +32,34 @@ WEBHOOK_SECRET = os.environ.get("BROWSER_WEBHOOK_SECRET", "")
 RUNNER_ENABLED = os.environ.get("CHROME_RUNNER_ENABLED", "").lower() == "true"
 
 
+async def _cancel_obsolete_chrome_jobs():
+    """With Scrapfly handling unblocking server-side, the local-Chrome queue is
+    obsolete. Cancel any lingering queued/running jobs and clear their scans'
+    status so the UI stops showing 'waiting for Chrome runner'."""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(ChromeJob).where(ChromeJob.status.in_(["queued", "running"]))
+        )
+        jobs = result.scalars().all()
+        for j in jobs:
+            j.status = "cancelled"
+            j.error = "Obsolete — Scrapfly handles scanning server-side."
+            run = await db.get(ScanRun, j.scan_id)
+            if run and run.chrome_job_status in ("queued", "running"):
+                run.chrome_job_status = None
+        await db.commit()
+        if jobs:
+            log.info("Cancelled %d obsolete Chrome jobs (Scrapfly active)", len(jobs))
+
+
 async def chrome_job_processor():
     """Background asyncio task — started by FastAPI on startup."""
     log.info("Chrome processor started (runner_enabled=%s)", RUNNER_ENABLED)
+    if os.environ.get("SCRAPFLY_KEY", "").strip():
+        try:
+            await _cancel_obsolete_chrome_jobs()
+        except Exception as exc:
+            log.warning("Obsolete Chrome-job cleanup failed: %s", exc)
     while True:
         try:
             if not RUNNER_ENABLED:

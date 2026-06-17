@@ -141,7 +141,7 @@ def render_html(
 
     # ── Top opportunities: the 3 weakest dimensions, consultatively framed ────
     ranked = sorted(
-        [k for k in DIMENSION_ORDER if k in scores],
+        [k for k in DIMENSION_ORDER if k in scores and scores[k].get("measured", True)],
         key=lambda k: scores[k].get("score", 0) / max(scores[k].get("max_score", 1), 1),
     )
     opp_html = ""
@@ -159,14 +159,20 @@ def render_html(
         dim = scores.get(key, {})
         s = dim.get("score", 0)
         m = dim.get("max_score", 0) or 1
-        pct = min(s / m * 100, 100)
-        bar = "#16a34a" if pct >= 70 else ("#f59e0b" if pct >= 40 else "#ef4444")
+        measured = dim.get("measured", True)
         row_bg = "#F6F6F7" if i % 2 == 1 else "#FFFFFF"
         finding = _client_finding(key, dim.get("finding", ""), has_reviews)
+        if measured:
+            pct = min(s / m * 100, 100)
+            bar = "#16a34a" if pct >= 70 else ("#f59e0b" if pct >= 40 else "#ef4444")
+            score_cell = (f'<div class="bw"><div class="b" style="width:{pct:.0f}%;background:{bar}"></div></div>'
+                          f'<span class="sn">{s:.0f}/{m}</span>')
+        else:
+            score_cell = '<span class="na">Not measured</span>'
         dim_rows += f"""
         <tr style="background:{row_bg}">
           <td class="dn"><strong>{_esc(DIMENSION_LABELS.get(key, key))}</strong><span class="why">{_esc(WHY_IT_MATTERS.get(key, ''))}</span></td>
-          <td class="ds"><div class="bw"><div class="b" style="width:{pct:.0f}%;background:{bar}"></div></div><span class="sn">{s:.0f}/{m}</span></td>
+          <td class="ds">{score_cell}</td>
           <td class="df">{_esc(finding)}</td>
         </tr>"""
 
@@ -237,7 +243,7 @@ table.dt th {{ text-align: left; font-size: 6.5pt; font-weight: 800; color: #fff
 table.dt td {{ padding: 4pt 7pt; vertical-align: top; }}
 .dn {{ width: 26%; }} .dn strong {{ font-size: 8pt; font-weight: 700; color: #111; display: block; }}
 .why {{ font-weight: 400; color: #888; font-size: 6.5pt; display: block; margin-top: 1pt; line-height: 1.3; }}
-.ds {{ width: 17%; }} .bw {{ height: 6pt; background: #e5e5e7; border-radius: 3pt; margin: 3pt 0 2pt; }} .b {{ height: 6pt; border-radius: 3pt; }} .sn {{ font-size: 6.5pt; color: #666; }}
+.ds {{ width: 17%; }} .bw {{ height: 6pt; background: #e5e5e7; border-radius: 3pt; margin: 3pt 0 2pt; }} .b {{ height: 6pt; border-radius: 3pt; }} .sn {{ font-size: 6.5pt; color: #666; }} .na {{ font-size: 7pt; color: #999; font-style: italic; }}
 .df {{ width: 57%; font-size: 7pt; color: #333; line-height: 1.4; }}
 .ssg {{ display: flex; gap: 7pt; }}
 .ss-item {{ flex: 1; }} .ss {{ width: 100%; height: 64pt; object-fit: cover; object-position: top; border: 0.75pt solid #ddd; border-radius: 3pt; }}
