@@ -445,12 +445,9 @@ function ChromeStatusBanner({ jobStatus, brandName, fallbackReason, chromeStatus
 
 // ── Blocked state (bot protection blocked the scanner) ─────────────────────────
 
-function BlockedCard({ scan, error, chromeStatus, onTrigger, triggering, onRescan, rescanning, onBack }) {
-  const jobStatus = scan?.chrome_job_status
-  const browserPending = jobStatus === 'queued' || jobStatus === 'running'
-  const runnerOffline = browserPending && chromeStatus?.runner && !chromeStatus.runner.online
+function BlockedCard({ scan, error, onRescan, rescanning, onBack }) {
   const message = error || scan?.error_message ||
-    'The live site blocked the scanner. No score was generated.'
+    'This site is behind heavy bot protection and the scan couldn’t read it this time. Re-scanning usually gets through.'
 
   return (
     <div className="card p-6 text-center">
@@ -463,31 +460,13 @@ function BlockedCard({ scan, error, chromeStatus, onTrigger, triggering, onResca
       <p className="text-xs text-gray-500 max-w-md mx-auto">{message}</p>
 
       <div className="flex items-center justify-center gap-2 mt-4">
-        {browserPending ? (
-          <span className={`text-sm font-medium ${runnerOffline ? 'text-amber-700' : 'text-blue-600'}`}>
-            {runnerOffline ? 'Browser scan queued — runner offline' : '🌐 Browser scan queued — waiting for a runner…'}
-          </span>
-        ) : (
-          <button
-            onClick={onTrigger}
-            disabled={triggering}
-            className="btn-primary text-sm py-1.5 px-4"
-          >
-            {triggering ? 'Queuing…' : '🌐 Run Browser Scan'}
-          </button>
-        )}
-        <button onClick={onRescan} disabled={rescanning} className="btn-secondary text-sm py-1.5 px-4">
-          {rescanning ? 'Starting…' : 'Re-scan'}
+        <button onClick={onRescan} disabled={rescanning} className="btn-primary text-sm py-1.5 px-4">
+          {rescanning ? 'Re-scanning…' : 'Re-scan'}
         </button>
         <button onClick={onBack} className="btn-secondary text-sm py-1.5 px-4">
           Back to Dashboard
         </button>
       </div>
-      {runnerOffline && (
-        <p className="text-xs text-amber-700 mt-3">
-          Start the local Browser Scan runner and this queued scan will continue automatically.
-        </p>
-      )}
     </div>
   )
 }

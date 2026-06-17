@@ -65,17 +65,14 @@ def _is_refusal(text: str) -> bool:
 # error_message). A blocked scan produces NO score.
 _BLOCK_MESSAGES = {
     "bot_block_detected": (
-        "The live site is behind bot protection (Cloudflare / PerimeterX / "
-        "DataDome) and blocked the scanner. No score was generated — run a "
-        "Browser Scan from a real browser to audit it."
+        "This site is behind heavy bot protection and the scan couldn't read it "
+        "this time. No score was generated — re-scanning usually gets through."
     ),
     "page_render_failed": (
-        "The site failed to render (timeout or hard block). No score was "
-        "generated — try a Browser Scan."
+        "The site didn't respond in time. No score was generated — please re-scan."
     ),
     "empty_render": (
-        "The site returned an empty page to the scanner, which usually means a "
-        "block. No score was generated — try a Browser Scan."
+        "The site returned an empty page. No score was generated — please re-scan."
     ),
 }
 

@@ -23,7 +23,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from .browser import PDP_PATH_RE, SHOP_PATH_RE, BESTSELLER_KEYWORDS, SS_BASE
+from .browser import PDP_PATH_RE, SHOP_PATH_RE, BESTSELLER_KEYWORDS, SS_BASE, detect_block
 
 log = logging.getLogger("scanner.scrapfly")
 
@@ -229,7 +229,18 @@ class ScrapflyAuditor:
 
     async def get_html(self, url: str, wait_for_reviews: bool = False) -> Optional[str]:
         res = await scrapfly_scrape(self._client, url, render=True, auto_scroll=wait_for_reviews)
-        return res["html"] or None
+        html = res["html"] or None
+        # Scrapfly's anti-bot bypass is probabilistic — if a fetch trips a
+        # challenge, one retry (fresh IP) almost always clears it. Avoids a
+        # false 'blocked' on a site Scrapfly can actually reach.
+        if html and detect_block(html):
+            log.info("Scrapfly result for %s looked blocked — retrying once", url)
+            res2 = await scrapfly_scrape(self._client, url, render=True,
+                                         auto_scroll=wait_for_reviews, wait_ms=5000)
+            if res2["html"] and not detect_block(res2["html"]):
+                return res2["html"]
+            return res2["html"] or html
+        return html
 
     async def get_pdp_with_reviews(self, url: str) -> Tuple[Optional[str], dict]:
         res = await scrapfly_scrape(self._client, url, render=True, auto_scroll=True, wait_ms=4000)
