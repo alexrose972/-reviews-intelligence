@@ -18,6 +18,7 @@ from .utils import (
 )
 from .browser import PlaywrightAuditor, detect_block
 from .branding import fetch_brand_logo
+from .scrapfly_client import ScrapflyAuditor
 from .dimensions import (
     llm_crawlability, review_richness, review_recency,
     visibility, rich_snippets, page_speed,
@@ -274,9 +275,17 @@ async def run_scan(
             return {"score": 0, "max_score": max_s, "finding": f"Scoring error: {exc}"}
 
     try:
-        async with PlaywrightAuditor(
-            proxy_url=(os.environ.get("PROXY_URL") or None) if use_proxy else None
-        ) as auditor:
+        # Scrapfly (API unblocker) is primary when SCRAPFLY_KEY is set — no
+        # browser, no proxy management, beats Cloudflare/PerimeterX server-side.
+        # Falls back to Playwright (optionally via residential proxy) otherwise.
+        if os.environ.get("SCRAPFLY_KEY", "").strip():
+            auditor_cm = ScrapflyAuditor()
+            log.info("Scan %s using Scrapfly auditor", scan_id)
+        else:
+            auditor_cm = PlaywrightAuditor(
+                proxy_url=(os.environ.get("PROXY_URL") or None) if use_proxy else None
+            )
+        async with auditor_cm as auditor:
 
             # ── Phase 1: PDP Discovery ────────────────────────────────────────
             await emit("fetch", "running", message=f"Navigating {domain} to find product pages...")
@@ -298,7 +307,8 @@ async def run_scan(
                 # datacenter-IP blocks clear when the request comes from a
                 # residential IP. Only paid bandwidth is spent on blocked sites.
                 proxy_url = os.environ.get("PROXY_URL", "").strip()
-                if proxy_url and not use_proxy:
+                using_scrapfly = bool(os.environ.get("SCRAPFLY_KEY", "").strip())
+                if proxy_url and not use_proxy and not using_scrapfly:
                     log.info("Scan %s blocked (%s) — retrying via residential proxy",
                              scan_id, block_reason)
                     _log("proxy_retry", reason=block_reason)
