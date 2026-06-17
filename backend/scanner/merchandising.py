@@ -24,11 +24,20 @@ _UGC_CONTAINER_SEL = (
     "[class*='customer-photo' i], [class*='review-gallery' i], [class*='photo-grid' i], "
     "[class*='review-media' i]"
 )
-_SKIP_IMG = ("sprite", "icon", "logo", "placeholder", "avatar", "data:")
+_SKIP_IMG = ("sprite", "icon", "logo", "placeholder", "avatar", "data:",
+             ".svg", ".gif", ".ico")  # customer photos are raster, never vector/icon
 
 _RECENCY_RE = re.compile(r"sort\s*by[^.]{0,20}?(most recent|newest|recent)", re.I)
 _RECENCY_OPTION_RE = re.compile(r"(most recent|newest)", re.I)
 _OUT_OF_5_RE = re.compile(r"(\d(?:\.\d)?)\s*(?:out of|/)\s*5", re.I)
+_RECENT_REL_RE = re.compile(
+    r"\b(?:just now|today|yesterday|(?:\d+|a|an)\s*(?:second|minute|hour|day|week)s?\s*ago)\b", re.I)
+_DATE_SEL = '[itemprop="datePublished"], [class*="review-date" i], [class*="review-time" i], time'
+
+# Image src hints for widget-served customer photos (when the gallery isn't a
+# plain <img> grid we can scope to).
+_UGC_SRC_HINTS = ("ugc", "/review", "review-image", "reviewimage", "junip", "okendo",
+                  "yotpo", "loox", "stamped", "fera", "rivyo", "cdn-reviews")
 
 
 def _detect_default_sort(soup: BeautifulSoup) -> Optional[str]:
@@ -92,27 +101,37 @@ def extract_ugc_image_urls(htmls: List[str], base_url: str, limit: int = 6) -> L
     """First customer-photo URLs from the review/UGC gallery, in display order."""
     urls: List[str] = []
     seen = set()
+
+    def _add(img) -> bool:
+        src = img.get("src") or img.get("data-src") or img.get("data-original")
+        if not src and img.get("srcset"):
+            src = img["srcset"].split(",")[0].strip().split(" ")[0]
+        if not src:
+            return False
+        u = urljoin(base_url, src)
+        low = u.lower()
+        if not u.startswith("http") or any(s in low for s in _SKIP_IMG) or u in seen:
+            return False
+        seen.add(u)
+        urls.append(u)
+        return True
+
     for h in htmls:
         if not h:
             continue
         soup = BeautifulSoup(h, "lxml")
+        # 1) images inside an explicit UGC/gallery container
         for container in soup.select(_UGC_CONTAINER_SEL):
             for img in container.find_all("img"):
-                src = img.get("src") or img.get("data-src") or img.get("data-original")
-                if not src and img.get("srcset"):
-                    src = img["srcset"].split(",")[0].strip().split(" ")[0]
-                if not src:
-                    continue
-                u = urljoin(base_url, src)
-                low = u.lower()
-                if not u.startswith("http") or any(s in low for s in _SKIP_IMG):
-                    continue
-                if u in seen:
-                    continue
-                seen.add(u)
-                urls.append(u)
-                if len(urls) >= limit:
+                if _add(img) and len(urls) >= limit:
                     return urls
+        # 2) any image whose src looks widget/review-CDN served (Junip/Okendo/…)
+        if len(urls) < limit:
+            for img in soup.find_all("img"):
+                s = (img.get("src") or img.get("data-src") or "").lower()
+                if any(hint in s for hint in _UGC_SRC_HINTS):
+                    if _add(img) and len(urls) >= limit:
+                        return urls
     return urls
 
 
@@ -127,11 +146,26 @@ def analyze(pdp_htmls: List[str], reviews_page_html: Optional[str] = None) -> di
     default_sort = None
     low_star = False
     ugc = False
+    top_dates: List[str] = []
     for h in htmls:
         soup = BeautifulSoup(h, "lxml")
         default_sort = default_sort or _detect_default_sort(soup)
         low_star = low_star or _first_page_low_star(soup)
         ugc = ugc or _has_ugc_gallery(soup)
+        if not top_dates:
+            for el in soup.select(_DATE_SEL):
+                v = el.get("datetime") or el.get("content") or el.get_text(" ", strip=True)
+                if v:
+                    top_dates.append(v[:30])
+                if len(top_dates) >= 5:
+                    break
+
+    # Infer recency sort when the top reviews are all very recent (widgets that
+    # default to newest-first without a literal "Most Recent" label, e.g. Junip).
+    if default_sort is None and top_dates:
+        recent = sum(1 for d in top_dates if _RECENT_REL_RE.search(d))
+        if recent >= 3:
+            default_sort = "recency"
 
     flags: List[str] = []
     if default_sort == "recency":

@@ -125,13 +125,14 @@ def extract_reviews_from_html(html: str) -> dict:
         if len(data["review_texts"]) >= 5:
             break
 
-    for sel in ['[itemprop="ratingValue"]', '[class*="average-rating" i]',
-                '[class*="avg-score" i]', '[class*="star-rating" i]']:
+    for sel in ['[itemprop="ratingValue"]', '[class*="average-rating" i]', '[class*="avg-score" i]']:
         el = soup.select_one(sel)
         if el:
-            v = el.get("content") or el.get_text(strip=True)
-            if v:
-                data["star_ratings"].append(v[:10])
+            v = el.get("content") or el.get_text(" ", strip=True) or ""
+            mm = re.search(r"\b([0-5](?:\.\d)?)\b", v)  # numeric ratings only, no widget text
+            if mm:
+                data["star_ratings"].append(mm.group(1))
+                break
 
     for el in soup.select('[itemprop="datePublished"], [class*="review-date" i], [class*="review-time" i]'):
         v = el.get("content") or el.get_text(strip=True)
