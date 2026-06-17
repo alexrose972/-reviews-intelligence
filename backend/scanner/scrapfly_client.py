@@ -153,6 +153,7 @@ class ScrapflyAuditor:
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
+        self._cat_cache: Optional[Tuple[Optional[str], Optional[str]]] = None  # save API calls
 
     async def __aenter__(self):
         self._client = httpx.AsyncClient(follow_redirects=True)
@@ -210,14 +211,14 @@ class ScrapflyAuditor:
         home = await scrapfly_scrape(self._client, base_url, render=True)
         shop = harvest(home["html"]) or []
 
-        for _, shop_url in shop[:3]:
+        for _, shop_url in shop[:2]:
             if len(pdps) >= 5:
                 break
             res = await scrapfly_scrape(self._client, shop_url, render=True)
             harvest(res["html"])
 
         if len(pdps) < 3:
-            for path in ["/collections/best-sellers", "/collections/all", "/products", "/shop"]:
+            for path in ["/collections/best-sellers", "/collections/all"]:
                 if len(pdps) >= 5:
                     break
                 res = await scrapfly_scrape(self._client, urljoin(base_url, path), render=True)
@@ -227,13 +228,18 @@ class ScrapflyAuditor:
         return pdps[:5]
 
     async def find_category_url(self, base_url: str) -> Tuple[Optional[str], Optional[str]]:
-        for path in ["/collections/all", "/collections/best-sellers", "/collections", "/shop", "/products"]:
+        if self._cat_cache is not None:
+            return self._cat_cache
+        result: Tuple[Optional[str], Optional[str]] = (None, None)
+        for path in ["/collections/all", "/collections/best-sellers", "/shop"]:
             url = urljoin(base_url, path)
             res = await scrapfly_scrape(self._client, url, render=True)
             st = res["status"]
             if res["html"] and len(res["html"]) > 2000 and (st is None or 200 <= st < 400):
-                return url, res["html"]
-        return None, None
+                result = (url, res["html"])
+                break
+        self._cat_cache = result
+        return result
 
     async def get_category_html(self, base_url: str) -> Tuple[Optional[str], Optional[str]]:
         return await self.find_category_url(base_url)

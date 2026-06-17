@@ -19,6 +19,7 @@ from .utils import (
 from .browser import PlaywrightAuditor, detect_block
 from .branding import fetch_brand_logo
 from .scrapfly_client import ScrapflyAuditor
+from .merchandising import analyze as analyze_merchandising
 from .dimensions import (
     llm_crawlability, review_richness, review_recency,
     visibility, rich_snippets, page_speed,
@@ -88,8 +89,14 @@ def build_pitch_angles(
     llm_failed: bool,
     vertical: Optional[str],
     vertical_play: str,
+    merch_flags: Optional[List[str]] = None,
 ) -> List[str]:
     angles = []
+
+    # Merchandising flags (Most-Recent sort, low-star review up top) are vivid,
+    # conversion-focused pitch material — lead with up to one.
+    for f in (merch_flags or [])[:1]:
+        angles.append(f)
 
     # Only surface the LLM-quote angle when there is a GENUINE quote — never a
     # model refusal ("I'm not able to browse the internet…"), which says nothing
@@ -562,9 +569,19 @@ async def run_scan(
             detected_platform.lower() != sf_reviews_provider.lower()
         )
 
+        # Review-merchandising audit (Most-Recent sort, low-star review up top,
+        # UGC gallery) — conversion signals that map straight to Yotpo Smart Sort.
+        merch = analyze_merchandising(pdp_htmls, reviews_page_html)
+        if merch.get("flags"):
+            _log("merchandising_flags", flags=merch["flags"],
+                 default_sort=merch.get("default_sort"),
+                 low_star_up_top=merch.get("low_star_up_top"),
+                 has_ugc_gallery=merch.get("has_ugc_gallery"))
+
         pitch_angles = build_pitch_angles(
             brand_name, all_scores, detected_platform, sf_reviews_provider,
             platform_mismatch, llm_review_quote, llm_failed, vertical, vertical_play,
+            merch_flags=merch.get("flags"),
         )
 
         recommendations = [
