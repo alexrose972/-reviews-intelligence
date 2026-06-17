@@ -29,6 +29,11 @@ log = logging.getLogger("scanner.scrapfly")
 
 API = "https://api.scrapfly.io/scrape"
 
+# Non-product paths to skip when harvesting product URLs from sitemaps.
+_NONPRODUCT_PATH = re.compile(
+    r"/(collections?|categor(?:y|ies)|pages?|policies|blogs?|account|cart|search|"
+    r"about|contact|stores?|gift|faq|help|login|wishlist)(/|$)", re.I)
+
 # JS run before screenshots: close/remove cookie banners, email-capture modals,
 # and full-screen fixed overlays so the shot shows the real page, not a popup.
 _POPUP_KILL_JS = (
@@ -294,8 +299,85 @@ class ScrapflyAuditor:
                 res = await scrapfly_scrape(self._client, urljoin(base_url, path), render=True)
                 harvest(res["html"])
 
+        # Sitemap fallback — most universal (Shopify always has product sitemaps,
+        # and many storefronts list products there even when the homepage doesn't).
+        if len(pdps) < 3:
+            for u in await self._pdp_urls_from_sitemap(base_url, host):
+                if u not in seen:
+                    seen.add(u)
+                    pdps.append(u)
+                if len(pdps) >= 5:
+                    break
+
         log.info("Scrapfly PDP discovery for %s: %d URLs", base_url, len(pdps))
         return pdps[:5]
+
+    async def _fetch_sitemap(self, url: str) -> str:
+        """Fetch a sitemap/robots file. Sitemaps are built for crawlers, so a
+        cheap direct GET works on most sites; fall back to Scrapfly if blocked."""
+        try:
+            r = await self._client.get(
+                url, timeout=25,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; YotpoReviewsBot/1.0)"},
+            )
+            if r.status_code == 200 and (r.text or "").strip():
+                return r.text
+        except Exception:
+            pass
+        res = await scrapfly_scrape(self._client, url, render=False, asp=True)
+        return res["html"] or ""
+
+    async def _pdp_urls_from_sitemap(self, base_url: str, host: str) -> List[str]:
+        """Find product URLs via robots.txt → sitemap(s). Handles sitemap indexes
+        (prioritising product-named children, e.g. Shopify sitemap_products_*)."""
+        bare = host.replace("www.", "")
+        entries: List[str] = []
+        robots = await self._fetch_sitemap(urljoin(base_url, "/robots.txt"))
+        for line in robots.splitlines():
+            if line.lower().strip().startswith("sitemap:"):
+                entries.append(line.split(":", 1)[1].strip())
+        entries += [urljoin(base_url, "/sitemap.xml"), urljoin(base_url, "/sitemap_index.xml")]
+
+        queue = list(dict.fromkeys(entries))[:6]
+        seen_sm: set = set()
+        product_urls: List[str] = []
+        fetched = 0
+        while queue and fetched < 8 and len(product_urls) < 50:
+            sm = queue.pop(0)
+            if sm in seen_sm:
+                continue
+            seen_sm.add(sm)
+            fetched += 1
+            xml = await self._fetch_sitemap(sm)
+            locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml, re.I)
+            if "<sitemapindex" in xml.lower():
+                children = [c for c in locs if c not in seen_sm]
+                product_children = [c for c in children if re.search(r"product", c, re.I)]
+                for c in (product_children or children)[:4]:
+                    queue.append(c)
+            else:
+                is_product_sm = bool(re.search(r"product", sm, re.I))
+                for loc in locs:
+                    p = urlparse(loc)
+                    if p.netloc and not p.netloc.endswith(bare):
+                        continue
+                    path = p.path or "/"
+                    # Skip the homepage and obvious non-product pages.
+                    if path in ("", "/") or _NONPRODUCT_PATH.search(path):
+                        continue
+                    # Accept all URLs from a product-named sitemap; otherwise only
+                    # those matching a product URL pattern.
+                    if is_product_sm or PDP_PATH_RE.search(loc):
+                        product_urls.append(loc)
+                    if len(product_urls) >= 50:
+                        break
+        # Spread out the picks rather than taking 5 adjacent SKUs.
+        uniq = list(dict.fromkeys(product_urls))
+        if len(uniq) > 5:
+            step = max(1, len(uniq) // 5)
+            uniq = uniq[::step][:5]
+        log.info("Sitemap discovery for %s: %d product URLs", base_url, len(uniq))
+        return uniq[:5]
 
     async def find_category_url(self, base_url: str) -> Tuple[Optional[str], Optional[str]]:
         if self._cat_cache is not None:
