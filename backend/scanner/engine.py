@@ -433,7 +433,8 @@ async def run_scan(
             llm_result = await safe_run(
                 "dim_llm_crawlability",
                 llm_crawlability.score(
-                    base_url, pdp_htmls[0] if pdp_htmls else homepage_html, skip_llm
+                    base_url, pdp_htmls[0] if pdp_htmls else homepage_html, skip_llm,
+                    brand=brand_name, product_url=(pdp_urls[0] if pdp_urls else base_url),
                 ),
                 default={"score": 0, "max_score": SCORE_WEIGHTS["llm_crawlability"],
                          "finding": "LLM check failed.", "failed": True},

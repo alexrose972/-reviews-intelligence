@@ -8,6 +8,9 @@ We deliberately do NOT ask a no-web-tool model to "quote a review" — it always
 refuses ("I can't browse the internet"), which measures the probe, not the site.
 """
 
+import logging
+import os
+import re
 from typing import Optional
 
 from ..utils import (
@@ -16,10 +19,26 @@ from ..utils import (
 )
 from bs4 import BeautifulSoup
 
+log = logging.getLogger("scanner.llm_crawlability")
 MAX_PTS = SCORE_WEIGHTS["llm_crawlability"]
 
 
-async def score(domain_url: str, rendered_html: str, skip_llm: bool = False) -> dict:
+def _ground_truth(soup: BeautifulSoup) -> str:
+    """Build review ground-truth text for the AEO judge from the page."""
+    texts = extract_review_texts(soup)
+    parts = list(texts[:15])
+    page_txt = soup.get_text(" ", strip=True)
+    m = re.search(r"(\d[\d,]*)\s*(?:reviews?|ratings?)", page_txt, re.I)
+    if m:
+        parts.append(f"Visible review count: {m.group(1)}.")
+    rv = soup.select_one('[itemprop="ratingValue"]')
+    if rv:
+        parts.append(f"Visible rating value: {rv.get('content') or rv.get_text(strip=True)}.")
+    return "\n".join(parts)
+
+
+async def score(domain_url: str, rendered_html: str, skip_llm: bool = False,
+                brand: str = "", product_url: str = "") -> dict:
     html = rendered_html or ""
     jsonld = extract_jsonld(html) if html else []
     has_agg = has_aggregate_rating(jsonld)
@@ -69,7 +88,7 @@ async def score(domain_url: str, rendered_html: str, skip_llm: bool = False) -> 
             "ChatGPT, Perplexity, Gemini, and Google rich results."
         )
 
-    return {
+    static = {
         "score": pts,
         "max_score": MAX_PTS,
         "finding": finding,
@@ -79,3 +98,27 @@ async def score(domain_url: str, rendered_html: str, skip_llm: bool = False) -> 
         "has_schema": has_agg or has_rev,
         "review_texts_in_html": n_texts,
     }
+
+    # ── Live AEO probe ────────────────────────────────────────────────────────
+    # When enabled, actually ask a web-search AI the canonical review questions
+    # and judge its answers against the page's review content. This measures real
+    # AI readability, not just schema presence. Falls back to `static` on any issue.
+    if (not skip_llm and os.environ.get("ANTHROPIC_API_KEY")
+            and os.environ.get("AEO_PROBE", "true").lower() == "true" and html):
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            gt = _ground_truth(soup)
+            if gt.strip():  # only probe when the page actually exposes review content
+                from ..aeo_probe import run_aeo_probe
+                title = (soup.title.string or "")[:120] if soup.title else ""
+                aeo = await run_aeo_probe(
+                    product_url or domain_url, brand or clean_domain(domain_url), gt, title, MAX_PTS
+                )
+                if aeo:
+                    aeo.update({"review_quote": "", "complaint_quote": "", "failed": False,
+                                "has_schema": has_agg or has_rev, "review_texts_in_html": n_texts})
+                    return aeo
+        except Exception as exc:
+            log.warning("AEO probe failed, using static crawlability score: %s", exc)
+
+    return static
