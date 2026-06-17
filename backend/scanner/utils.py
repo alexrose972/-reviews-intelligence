@@ -86,6 +86,8 @@ VERTICAL_SIGNALS_MAP = {
                   "tent", "wilderness", "weather", "durable"],
     "pet":       ["dog", "cat", "puppy", "kitten", "paw", "kibble", "leash",
                   "crate", "veterinary", "breed"],
+    "beverage":  ["soda", "sparkling", "prebiotic", "seltzer", "kombucha",
+                  "carbonated", "beverage", "fizzy", "flavor", "refreshing"],
 }
 
 VERTICAL_PLAYS = {
@@ -96,6 +98,7 @@ VERTICAL_PLAYS = {
     "home":      "Flag the assembly/quality play: reviews that mention sturdiness and ease of assembly are top purchase drivers.",
     "outdoor":   "Flag the durability play: weather and trail language = proof points for performance marketing.",
     "pet":       "Flag the pet-parent trust play: breed and vet-adjacent language in reviews drives high-LTV repeat purchases.",
+    "beverage":  "Flag the flavor/taste play: flavor and 'better-for-you' language in reviews is the top purchase driver and repeat-buy signal for beverages.",
 }
 
 
@@ -147,13 +150,23 @@ def detect_platform(html: str) -> Optional[str]:
 
 
 def detect_vertical(text: str) -> Optional[str]:
+    """Whole-word signal matching with a confidence threshold.
+
+    Naive substring matching mislabels brands ('cat' inside 'category', 'dog'/
+    'paw' inside random copy made a soda brand read as 'Pet'). We require
+    word-boundary matches AND at least 2 distinct signals before assigning a
+    vertical — otherwise return None rather than guess wrong in a client doc.
+    """
     lower = text.lower()
     scores = {}
     for vertical, signals in VERTICAL_SIGNALS_MAP.items():
-        hit = sum(1 for s in signals if s in lower)
+        hit = sum(1 for s in signals if re.search(r"\b" + re.escape(s) + r"\b", lower))
         if hit:
             scores[vertical] = hit
-    return max(scores, key=scores.get) if scores else None
+    if not scores:
+        return None
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 2 else None
 
 
 def extract_jsonld(html: str) -> List[dict]:

@@ -48,9 +48,38 @@ _POPUP_KILL_JS = (
 )
 
 
-def _popup_kill_scenario() -> str:
-    """Base64 js_scenario: wait for late popups, remove them, settle, then shoot."""
-    steps = [{"wait": 3000}, {"execute": {"script": _POPUP_KILL_JS}}, {"wait": 700}]
+# Force lazy-loaded images (data-src / loading="lazy") to paint so screenshots
+# don't show blank product-image placeholders.
+_LAZY_IMG_JS = (
+    '(function(){try{document.querySelectorAll("img").forEach(function(im){try{'
+    'if(im.getAttribute("loading")==="lazy")im.setAttribute("loading","eager");'
+    'var ds=im.getAttribute("data-src")||im.getAttribute("data-original")||im.getAttribute("data-lazy-src");'
+    'if(ds&&(!im.getAttribute("src")||im.getAttribute("src").indexOf("data:")===0))im.setAttribute("src",ds);'
+    'var dss=im.getAttribute("data-srcset")||im.getAttribute("data-lazy-srcset");'
+    'if(dss&&!im.getAttribute("srcset"))im.setAttribute("srcset",dss);'
+    'im.style.opacity="1";im.style.visibility="visible";'  # defeat fade-in-on-load
+    '}catch(e){}});'
+    'document.querySelectorAll("source[data-srcset],source[data-src]").forEach(function(s){try{'
+    'var v=s.getAttribute("data-srcset")||s.getAttribute("data-src");if(v)s.setAttribute("srcset",v);}catch(e){}});'
+    'document.querySelectorAll("[data-bg],[data-background],[data-bg-src]").forEach(function(el){try{'
+    'var b=el.getAttribute("data-bg")||el.getAttribute("data-background")||el.getAttribute("data-bg-src");'
+    'if(b)el.style.backgroundImage="url("+b+")";}catch(e){}});}catch(e){}})();'
+)
+
+
+def _screenshot_scenario() -> str:
+    """Base64 js_scenario for screenshots: clear popups, force lazy images to
+    load, scroll through to trigger any remaining lazy loaders, then settle."""
+    steps = [
+        {"wait": 2500},
+        {"execute": {"script": _POPUP_KILL_JS}},
+        {"execute": {"script": _LAZY_IMG_JS}},
+        {"scroll": {"x": 0, "y": 9999}},
+        {"wait": 1500},
+        {"scroll": {"x": 0, "y": 0}},
+        {"execute": {"script": _LAZY_IMG_JS}},
+        {"wait": 2500},
+    ]
     return base64.b64encode(json.dumps(steps).encode()).decode()
 
 
@@ -80,7 +109,8 @@ async def scrapfly_scrape(
         params["rendering_wait"] = str(wait_ms)
     if screenshot:
         params["screenshots[main]"] = "fullpage"
-        params["js_scenario"] = _popup_kill_scenario()  # no popups in the shot
+        params["auto_scroll"] = "true"  # trigger intersection-observer lazy loaders
+        params["js_scenario"] = _screenshot_scenario()  # popups gone + images loaded
 
     try:
         r = await client.get(API, params=params, timeout=150)

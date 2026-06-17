@@ -551,6 +551,31 @@ async def run_scan(
                     "No review text extracted from any PDP — score zeroed to prevent fabrication."
                 )
 
+            # If reviews demonstrably EXIST (AggregateRating schema) but their text/
+            # dates weren't in the page HTML (BazaarVoice & co. load them client-side),
+            # 0 is a false negative that lies and tanks the score. Mark them
+            # 'not measured from page' with neutral credit instead.
+            reviews_exist = all_scores.get("rich_snippets", {}).get("score", 0) > 0
+            if reviews_exist:
+                rr = all_scores.get("review_richness")
+                if rr and rr.get("score", 0) == 0:
+                    rr["score"] = round(SCORE_WEIGHTS["review_richness"] * 0.5, 1)
+                    rr["finding"] = (
+                        "Review content loads via the on-site widget and isn't embedded in the page "
+                        "HTML, so depth couldn't be measured from the page."
+                    )
+                    _log("score_validation", dimension="review_richness", action="neutralized",
+                         reason="reviews_exist_text_not_in_html")
+                rc = all_scores.get("review_recency")
+                if rc and "could not extract" in (rc.get("finding", "") or "").lower():
+                    rc["score"] = round(SCORE_WEIGHTS["review_recency"] * 0.5, 1)
+                    rc["finding"] = (
+                        "Review dates load via the on-site widget and aren't embedded in the page "
+                        "HTML, so freshness couldn't be measured from the page."
+                    )
+                    _log("score_validation", dimension="review_recency", action="neutralized",
+                         reason="reviews_exist_dates_not_in_html")
+
             _log("score_validation_complete",
                  scores_summary={k: v.get("score") for k, v in all_scores.items()})
 
