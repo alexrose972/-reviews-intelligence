@@ -113,6 +113,32 @@ def _evidence_scenario(kind: str) -> str:
     return base64.urlsafe_b64encode(json.dumps(steps).encode()).decode()
 
 
+# Scroll to the review widget and dwell so lazy review platforms (BazaarVoice,
+# Yotpo, Okendo, Junip, Stamped, PowerReviews) render their schema + content
+# into the DOM — they don't load until scrolled into view.
+_REVIEW_SCROLL_JS = (
+    '(function(){try{var t=document.querySelector('
+    '\'#BVRRContainer,[data-bv-show],.bv-content-list,[id*="bazaarvoice" i],[class*="bazaarvoice" i],'
+    '[id*="pr-reviewdisplay" i],[class*="pr-review" i],[class*="yotpo" i],[class*="junip" i],'
+    '[class*="okendo" i],[class*="stamped" i],[class*="loox" i],[id*="reviews" i],[class*="reviews" i]\');'
+    'if(t){t.scrollIntoView({block:"center"});}else{window.scrollTo(0,document.body.scrollHeight*0.7);}'
+    '}catch(e){}})();'
+)
+
+
+def _review_render_scenario() -> str:
+    """Base64 js_scenario: scroll to the review widget and dwell so lazy review
+    platforms render their schema + review content before we read the HTML."""
+    steps = [
+        {"wait": 3000},
+        {"execute": {"script": _REVIEW_SCROLL_JS}},
+        {"wait": 7000},
+        {"execute": {"script": _REVIEW_SCROLL_JS}},
+        {"wait": 4000},
+    ]
+    return base64.urlsafe_b64encode(json.dumps(steps).encode()).decode()
+
+
 def _screenshot_scenario() -> str:
     """Base64 js_scenario for screenshots: clear popups, force lazy images to
     load, scroll through to trigger any remaining lazy loaders, then settle."""
@@ -142,6 +168,7 @@ async def scrapfly_scrape(
     auto_scroll: bool = False,
     screenshot: bool = False,
     wait_ms: int = 2500,
+    js_scenario: Optional[str] = None,
 ) -> dict:
     """One Scrapfly call → {html, status, screenshot}. Defensive: never raises."""
     params = {"key": _key(), "url": url, "country": "us"}
@@ -153,6 +180,8 @@ async def scrapfly_scrape(
         params["auto_scroll"] = "true"
     if wait_ms:
         params["rendering_wait"] = str(wait_ms)
+    if js_scenario:
+        params["js_scenario"] = js_scenario
     if screenshot:
         params["screenshots[main]"] = "fullpage"
         params["auto_scroll"] = "true"  # trigger intersection-observer lazy loaders
@@ -289,7 +318,10 @@ class ScrapflyAuditor:
         return html
 
     async def get_pdp_with_reviews(self, url: str) -> Tuple[Optional[str], dict]:
-        res = await scrapfly_scrape(self._client, url, render=True, auto_scroll=True, wait_ms=4000)
+        # Scroll to the review widget + dwell so lazy platforms (BazaarVoice etc.)
+        # render their schema + review content into the DOM before we read it.
+        res = await scrapfly_scrape(self._client, url, render=True, wait_ms=5000,
+                                    js_scenario=_review_render_scenario())
         html = res["html"]
         if not html:
             return None, {}
@@ -403,12 +435,25 @@ class ScrapflyAuditor:
                     if p.netloc and not p.netloc.endswith(bare):
                         continue
                     path = p.path or "/"
-                    # Skip the homepage and obvious non-product pages.
+                    low = loc.lower()
+                    # Skip homepage, non-product pages, and static assets.
                     if path in ("", "/") or _NONPRODUCT_PATH.search(path):
                         continue
-                    # Accept all URLs from a product-named sitemap; otherwise only
-                    # those matching a product URL pattern.
-                    if is_product_sm or PDP_PATH_RE.search(loc):
+                    if any(a in low for a in (".css", ".js", ".json", ".xml", "/static",
+                                              "demandware.static", "/cdn", "/media/")):
+                        continue
+                    # Product URL — pattern-agnostic so it works across platforms:
+                    #   • product-named sitemap (Shopify sitemap_products_*)
+                    #   • /products/, /p/, /item/ … (PDP_PATH_RE)
+                    #   • SFCC / Magento .html PDPs (/US/en/name/SKU.html)
+                    #   • a SKU-like code in the last path segment
+                    looks_product = (
+                        is_product_sm
+                        or PDP_PATH_RE.search(loc)
+                        or path.endswith(".html")
+                        or re.search(r"/[a-z0-9]*\d{3,}[a-z0-9]*/?$", path, re.I)
+                    )
+                    if looks_product:
                         product_urls.append(loc)
                     if len(product_urls) >= 50:
                         break

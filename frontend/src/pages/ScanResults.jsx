@@ -283,10 +283,6 @@ export default function ScanResults() {
                     {scan.triggered_at && (
                       <MetaChip label="Scanned" value={formatDate(scan.triggered_at)} />
                     )}
-                    <MetaChip
-                      label="Scan mode"
-                      value={scan.scan_mode === 'chrome' ? '🌐 Browser scan' : '⚡ Fast scan'}
-                    />
                   </div>
                 </div>
 

@@ -424,7 +424,7 @@ async def run_scan(
             # ── Phase 3: PDPs with deep review extraction ─────────────────────
             await emit("review_richness", "running",
                        message=f"Rendering {len(pdp_urls)} product pages (deep scroll + review extraction)...")
-            for i, url in enumerate(pdp_urls[:5]):
+            for i, url in enumerate(pdp_urls[:3]):
                 log.info("Rendering PDP %d/%d: %s", i + 1, len(pdp_urls), url)
                 html, review_data = await safe_run(
                     f"pdp_render_{i+1}",

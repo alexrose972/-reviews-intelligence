@@ -15,7 +15,7 @@ from typing import Optional
 
 from ..utils import (
     SCORE_WEIGHTS, clean_domain, extract_jsonld,
-    has_aggregate_rating, has_review_schema, extract_review_texts,
+    has_aggregate_rating, has_review_schema, has_microdata_rating, extract_review_texts,
 )
 from bs4 import BeautifulSoup
 
@@ -41,13 +41,15 @@ async def score(domain_url: str, rendered_html: str, skip_llm: bool = False,
                 brand: str = "", product_url: str = "") -> dict:
     html = rendered_html or ""
     jsonld = extract_jsonld(html) if html else []
-    has_agg = has_aggregate_rating(jsonld)
+    _soup = BeautifulSoup(html, "lxml") if html else None
+    # AggregateRating via JSON-LD OR microdata (BazaarVoice & co. use microdata).
+    has_agg = has_aggregate_rating(jsonld) or (bool(_soup) and has_microdata_rating(_soup))
     has_rev = has_review_schema(jsonld)
 
     n_texts = 0
     if html:
         try:
-            n_texts = len(extract_review_texts(BeautifulSoup(html, "lxml")))
+            n_texts = len(extract_review_texts(_soup))
         except Exception:
             n_texts = 0
 
