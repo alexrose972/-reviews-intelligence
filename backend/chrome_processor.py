@@ -77,6 +77,10 @@ async def chrome_job_processor():
             if not job:
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
+            if not RUNNER_ENABLED:
+                # Leave job in queued state — local Mac runner will execute it
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
             await process_chrome_job(job)
         except asyncio.CancelledError:
             break
