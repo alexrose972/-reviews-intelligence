@@ -200,8 +200,8 @@ export default function ScanResults() {
         {status === 'complete' && scan && !scan.chrome_job_status && (
           <LowConfidencePrompt
             scan={scan}
-            onTrigger={triggerChromeScan}
-            triggering={triggeringChrome}
+            onRescan={rescan}
+            rescanning={rescanning}
           />
         )}
 
@@ -246,7 +246,7 @@ export default function ScanResults() {
         {/* ── Complete state ── */}
         {status === 'complete' && scan && (
           <div className="space-y-6">
-            <EvidencePanel evidence={scan.evidence} onTrigger={triggerChromeScan} triggering={triggeringChrome} />
+            <EvidencePanel evidence={scan.evidence} onTrigger={rescan} triggering={rescanning} />
 
             {/* Score hero */}
             <div className="card p-6">
@@ -473,10 +473,11 @@ function BlockedCard({ scan, error, onRescan, rescanning, onBack }) {
 
 // ── Low-confidence manual Chrome trigger ───────────────────────────────────────
 
-function LowConfidencePrompt({ scan, onTrigger, triggering }) {
+function LowConfidencePrompt({ scan, onRescan, rescanning }) {
   const scores = scan.scores || {}
+  // Only count dimensions we actually MEASURED (exclude 'not measured' ones).
   const zeroCount = Object.entries(scores).filter(
-    ([k, v]) => k !== 'llm_crawlability' && (v?.score ?? 1) === 0
+    ([k, v]) => k !== 'llm_crawlability' && v?.measured !== false && (v?.score ?? 1) === 0
   ).length
   const isLowConfidence = (scan.overall_score ?? 100) < 30 && zeroCount >= 3
 
@@ -485,18 +486,18 @@ function LowConfidencePrompt({ scan, onTrigger, triggering }) {
   return (
     <div className="mb-6 p-4 rounded-xl border border-amber-200 bg-amber-50">
       <p className="text-sm font-semibold text-amber-800 mb-1">
-        ⚠️ Bot detection may have blocked this scan
+        ⚠️ This scan may be incomplete
       </p>
       <p className="text-sm text-amber-700 mb-3">
-        Score of {scan.overall_score}/100 with {zeroCount} dimensions at zero suggests
-        the site blocked Playwright. Run a Browser Scan for accurate results?
+        A low score with several areas at zero can mean the page didn’t fully load this time.
+        Re-scan for a cleaner read.
       </p>
       <button
-        onClick={onTrigger}
-        disabled={triggering}
+        onClick={onRescan}
+        disabled={rescanning}
         className="btn-primary text-sm py-1.5 px-4"
       >
-        {triggering ? 'Queuing…' : '🌐 Run Browser Scan'}
+        {rescanning ? 'Re-scanning…' : 'Re-scan'}
       </button>
     </div>
   )
@@ -574,7 +575,7 @@ function EvidencePanel({ evidence, onTrigger, triggering }) {
           disabled={triggering}
           className="btn-primary text-sm py-1.5 px-4 mt-4"
         >
-          {triggering ? 'Queuing...' : 'Run Browser Scan'}
+          {triggering ? 'Re-scanning...' : 'Re-scan'}
         </button>
       )}
     </div>
