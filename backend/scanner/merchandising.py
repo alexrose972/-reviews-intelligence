@@ -15,8 +15,16 @@ Playwright paths. Returns flags as ready-to-use pitch lines.
 
 import re
 from typing import List, Optional
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
+
+_UGC_CONTAINER_SEL = (
+    "[class*='ugc' i], [class*='media-gallery' i], [class*='customer-image' i], "
+    "[class*='customer-photo' i], [class*='review-gallery' i], [class*='photo-grid' i], "
+    "[class*='review-media' i]"
+)
+_SKIP_IMG = ("sprite", "icon", "logo", "placeholder", "avatar", "data:")
 
 _RECENCY_RE = re.compile(r"sort\s*by[^.]{0,20}?(most recent|newest|recent)", re.I)
 _RECENCY_OPTION_RE = re.compile(r"(most recent|newest)", re.I)
@@ -78,6 +86,34 @@ def _has_ugc_gallery(soup: BeautifulSoup) -> bool:
         return True
     txt = soup.get_text(" ", strip=True).lower()
     return ("customer images" in txt) or ("customer photos" in txt) or ("customer images and videos" in txt)
+
+
+def extract_ugc_image_urls(htmls: List[str], base_url: str, limit: int = 6) -> List[str]:
+    """First customer-photo URLs from the review/UGC gallery, in display order."""
+    urls: List[str] = []
+    seen = set()
+    for h in htmls:
+        if not h:
+            continue
+        soup = BeautifulSoup(h, "lxml")
+        for container in soup.select(_UGC_CONTAINER_SEL):
+            for img in container.find_all("img"):
+                src = img.get("src") or img.get("data-src") or img.get("data-original")
+                if not src and img.get("srcset"):
+                    src = img["srcset"].split(",")[0].strip().split(" ")[0]
+                if not src:
+                    continue
+                u = urljoin(base_url, src)
+                low = u.lower()
+                if not u.startswith("http") or any(s in low for s in _SKIP_IMG):
+                    continue
+                if u in seen:
+                    continue
+                seen.add(u)
+                urls.append(u)
+                if len(urls) >= limit:
+                    return urls
+    return urls
 
 
 def analyze(pdp_htmls: List[str], reviews_page_html: Optional[str] = None) -> dict:

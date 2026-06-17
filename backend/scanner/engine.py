@@ -19,7 +19,8 @@ from .utils import (
 from .browser import PlaywrightAuditor, detect_block
 from .branding import fetch_brand_logo
 from .scrapfly_client import ScrapflyAuditor
-from .merchandising import analyze as analyze_merchandising
+from .merchandising import analyze as analyze_merchandising, extract_ugc_image_urls
+from .vision_ugc import check_ugc_quality
 from .dimensions import (
     llm_crawlability, review_richness, review_recency,
     visibility, rich_snippets, page_speed,
@@ -93,9 +94,9 @@ def build_pitch_angles(
 ) -> List[str]:
     angles = []
 
-    # Merchandising flags (Most-Recent sort, low-star review up top) are vivid,
-    # conversion-focused pitch material — lead with up to one.
-    for f in (merch_flags or [])[:1]:
+    # Merchandising flags (UGC curation, Most-Recent sort, low-star review up
+    # top) are vivid, conversion-focused pitch material — lead with up to two.
+    for f in (merch_flags or [])[:2]:
         angles.append(f)
 
     # Only surface the LLM-quote angle when there is a GENUINE quote — never a
@@ -572,6 +573,28 @@ async def run_scan(
         # Review-merchandising audit (Most-Recent sort, low-star review up top,
         # UGC gallery) — conversion signals that map straight to Yotpo Smart Sort.
         merch = analyze_merchandising(pdp_htmls, reviews_page_html)
+
+        # Visual UGC curation: judge the first gallery photos with Claude vision.
+        if (merch.get("has_ugc_gallery") and not skip_llm
+                and os.environ.get("ANTHROPIC_API_KEY")
+                and os.environ.get("UGC_VISION_CHECK", "true").lower() == "true"):
+            ugc_urls = extract_ugc_image_urls(
+                pdp_htmls + ([reviews_page_html] if reviews_page_html else []), base_url
+            )
+            if ugc_urls:
+                ugc = await safe_run(
+                    "ugc_vision", check_ugc_quality(ugc_urls, brand_name),
+                    default={"any_problem": False, "problems": []},
+                )
+                if ugc and ugc.get("any_problem"):
+                    issues = "; ".join(p.get("issue", "") for p in ugc.get("problems", [])[:2])
+                    merch.setdefault("flags", []).insert(
+                        0,
+                        f"{brand_name}'s review gallery leads with off-message customer photos "
+                        f"({issues}). Yotpo curates Visual UGC to put flattering, on-brand media first."
+                    )
+                    _log("ugc_vision_flag", problems=ugc.get("problems"))
+
         if merch.get("flags"):
             _log("merchandising_flags", flags=merch["flags"],
                  default_sort=merch.get("default_sort"),
