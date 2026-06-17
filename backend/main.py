@@ -242,14 +242,12 @@ async def api_download_pdf(scan_id: str, user: dict = Depends(require_auth)):
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
-    # Regenerate from DB data
-    raw_screenshots = run.screenshots_json or []
-    screenshot_paths = []
-    for item in raw_screenshots:
-        if isinstance(item, str):
-            screenshot_paths.append(item)
-        elif isinstance(item, dict) and "path" in item:
-            screenshot_paths.append(item["path"])
+    # Regenerate from DB data. Pass items through as-is — evidence items are
+    # {path, caption} dicts the PDF renders with their finding captions.
+    screenshot_paths = [
+        item for item in (run.screenshots_json or [])
+        if (isinstance(item, str)) or (isinstance(item, dict) and item.get("path"))
+    ]
 
     html = render_html(
         brand_name=run.brand_name,

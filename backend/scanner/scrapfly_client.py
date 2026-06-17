@@ -38,16 +38,24 @@ _NONPRODUCT_PATH = re.compile(
 # and full-screen fixed overlays so the shot shows the real page, not a popup.
 _POPUP_KILL_JS = (
     '(function(){try{'
+    # 1. Click obvious close buttons.
     'document.querySelectorAll(\'[aria-label*="close" i],button[class*="close" i],'
-    '[class*="popup"] [class*="close" i],[class*="modal"] [class*="close" i]\')'
+    '[class*="popup"] [class*="close" i],[class*="modal"] [class*="close" i],[class*="dismiss" i]\')'
     '.forEach(function(b){try{b.click()}catch(e){}});'
+    # 2. Remove known popup/modal/email-capture/game containers by class/role.
     '[\'[class*="popup" i]\',\'[class*="modal" i]\',\'[class*="overlay" i]\',\'[class*="newsletter" i]\','
-    '\'[class*="klaviyo" i]\',\'[class*="privy" i]\',\'[class*="attentive" i]\',\'[id*="popup" i]\','
-    '\'[role="dialog"]\',\'[aria-modal="true"]\',\'dialog\']'
-    '.forEach(function(s){document.querySelectorAll(s).forEach(function(e){try{e.remove()}catch(_){}})});'
-    'Array.prototype.slice.call(document.querySelectorAll("body *")).forEach(function(e){try{'
-    'var st=getComputedStyle(e);if(st.position==="fixed"&&parseInt(st.zIndex||0)>=40){'
-    'var r=e.getBoundingClientRect();if(r.width>window.innerWidth*0.55&&r.height>window.innerHeight*0.45)e.remove();}}catch(_){}});'
+    '\'[class*="klaviyo" i]\',\'[class*="privy" i]\',\'[class*="attentive" i]\',\'[class*="justuno" i]\','
+    '\'[id*="popup" i]\',\'[class*="gamif" i]\',\'[class*="spin" i]\',\'[class*="wheel" i]\','
+    '\'[class*="lightbox" i]\',\'[class*="interstitial" i]\',\'[role="dialog"]\',\'[aria-modal="true"]\',\'dialog\']'
+    '.forEach(function(s){try{document.querySelectorAll(s).forEach(function(e){try{e.remove()}catch(_){}})}catch(_){}});'
+    # 3. Aggressively remove ANY large overlay (fixed/absolute/sticky covering most
+    #    of the viewport) plus full-screen iframes — that is what popups/games are.
+    'Array.prototype.slice.call(document.querySelectorAll("body *, body iframe")).forEach(function(e){try{'
+    'var st=getComputedStyle(e),pos=st.position,z=parseInt(st.zIndex||0)||0,r=e.getBoundingClientRect();'
+    'var big=r.width>=window.innerWidth*0.6&&r.height>=window.innerHeight*0.55;'
+    'if((pos==="fixed"||pos==="absolute"||pos==="sticky")&&(z>=10||e.tagName==="IFRAME")&&big)e.remove();'
+    'else if(z>=1000&&r.width>200&&r.height>150)e.remove();'
+    '}catch(_){}});'
     'document.documentElement.style.overflow="auto";document.body.style.overflow="auto";'
     '}catch(e){}})();'
 )
@@ -72,6 +80,39 @@ _LAZY_IMG_JS = (
 )
 
 
+# JS expression that locates the element proving a given finding, so the
+# screenshot focuses on the evidence rather than a generic page shot.
+_EVIDENCE_TARGET = {
+    "reviews":  "(document.querySelector('[id*=\"yotpo\" i],[class*=\"yotpo\" i],[class*=\"junip\" i],[class*=\"okendo\" i],[class*=\"bv-content\" i],[class*=\"stamped\" i],[class*=\"loox\" i],[class*=\"review-list\" i],[class*=\"reviews-section\" i],[id*=\"reviews\" i]')||Array.prototype.slice.call(document.querySelectorAll('h1,h2,h3')).filter(function(e){return /\\breviews?\\b/i.test(e.textContent||'')}).pop())",
+    "sort":     "(Array.prototype.slice.call(document.querySelectorAll('select,button,[class*=\"sort\" i],label,[class*=\"dropdown\" i]')).filter(function(e){return /sort\\s*by|most recent|newest/i.test(e.textContent||'')})[0])",
+    "gallery":  "document.querySelector('[class*=\"ugc\" i],[class*=\"media-gallery\" i],[class*=\"customer-image\" i],[class*=\"customer-photo\" i],[class*=\"review-gallery\" i]')",
+    "category": "document.querySelector('[class*=\"product\" i][class*=\"grid\" i],[class*=\"collection\" i] [class*=\"product\" i],main')",
+    "top":      "document.body",
+}
+
+
+def _evidence_scenario(kind: str) -> str:
+    """Base64 js_scenario: kill popups, load images, scroll the evidence element
+    into view, then settle — so a viewport screenshot frames the finding."""
+    target = _EVIDENCE_TARGET.get(kind, _EVIDENCE_TARGET["top"])
+    scroll_js = (
+        "(function(){try{var t=" + target + ";"
+        "if(t&&t.scrollIntoView){t.scrollIntoView({block:'center',inline:'nearest'});}}catch(e){}})();"
+    )
+    steps = [
+        {"wait": 4000},
+        {"execute": {"script": _POPUP_KILL_JS}},
+        {"execute": {"script": _LAZY_IMG_JS}},
+        {"scroll": {"x": 0, "y": 9999}},          # trigger lazy review widgets
+        {"wait": 2500},
+        {"execute": {"script": _POPUP_KILL_JS}},   # catch popups that fire on scroll
+        {"execute": {"script": _LAZY_IMG_JS}},
+        {"execute": {"script": scroll_js}},        # now frame the evidence element
+        {"wait": 2000},
+    ]
+    return base64.urlsafe_b64encode(json.dumps(steps).encode()).decode()
+
+
 def _screenshot_scenario() -> str:
     """Base64 js_scenario for screenshots: clear popups, force lazy images to
     load, scroll through to trigger any remaining lazy loaders, then settle."""
@@ -85,7 +126,7 @@ def _screenshot_scenario() -> str:
         {"scroll": {"x": 0, "y": 0}},
         {"wait": 4000},
     ]
-    return base64.b64encode(json.dumps(steps).encode()).decode()
+    return base64.urlsafe_b64encode(json.dumps(steps).encode()).decode()
 
 
 def _key() -> str:
@@ -420,3 +461,27 @@ class ScrapflyAuditor:
                 except Exception as exc:
                     log.warning("Scrapfly screenshot save failed [%s]: %s", label, exc)
         return saved
+
+    async def capture_evidence(self, scan_id: str, shots: List[dict]) -> List[dict]:
+        """Evidence screenshots: a clean (popup-free, images-loaded) capture of the
+        page behind each negative finding. `shots`: [{label, url, caption}].
+        Returns [{label, path, caption}] for the ones that captured."""
+        safe = re.sub(r"[^\w]", "_", scan_id)
+        out_dir = SS_BASE / safe
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out: List[dict] = []
+        for shot in shots:
+            url = shot.get("url")
+            if not url:
+                continue
+            # Reuse the proven full-page capture (popup removal + lazy images).
+            res = await scrapfly_scrape(self._client, url, render=True, screenshot=True)
+            if res["screenshot"]:
+                try:
+                    path = out_dir / f"{shot['label']}.png"
+                    path.write_bytes(res["screenshot"])
+                    out.append({"label": shot["label"], "path": str(path),
+                                "caption": shot.get("caption", "")})
+                except Exception as exc:
+                    log.warning("Evidence shot save failed [%s]: %s", shot.get("label"), exc)
+        return out

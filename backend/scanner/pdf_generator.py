@@ -176,20 +176,24 @@ def render_html(
           <td class="df">{_esc(finding)}</td>
         </tr>"""
 
-    # ── Screenshots with honest captions ──────────────────────────────────────
+    # ── Evidence screenshots — each proves a finding (captioned accordingly) ───
     ss_html = ""
     for sp in (screenshot_paths or [])[:3]:
+        # Each item is either a {path, caption} dict (evidence) or a bare path.
+        if isinstance(sp, dict):
+            path, caption = sp.get("path"), sp.get("caption", "")
+        else:
+            path, caption = sp, SCREENSHOT_LABELS.get(Path(sp).stem, "")
         try:
-            b64 = base64.b64encode(Path(sp).read_bytes()).decode()
+            b64 = base64.b64encode(Path(path).read_bytes()).decode()
         except Exception:
             continue
-        stem = Path(sp).stem
-        label = SCREENSHOT_LABELS.get(stem, stem.replace("_", " ").title())
         ss_html += f"""
         <div class="ss-item"><img class="ss" src="data:image/png;base64,{b64}" />
-          <div class="ss-cap">{_esc(brand_name)} — {_esc(label)}</div></div>"""
+          <div class="ss-cap">{_esc(caption)}</div></div>"""
     screenshots_section = (
-        f'<div class="sec-h">What we reviewed</div><div class="ssg">{ss_html}</div>' if ss_html else ""
+        f'<div class="sec-h">Evidence — what we found on the page</div>'
+        f'<div class="ssg">{ss_html}</div>' if ss_html else ""
     )
 
     chips = []

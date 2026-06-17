@@ -163,6 +163,48 @@ def build_pitch_angles(
     return angles[:3]
 
 
+def _build_evidence(scores: dict, merch: dict, pdp_urls: list,
+                    cat_url: Optional[str], base_url: str) -> List[dict]:
+    """Pick screenshots that PROVE a negative finding — never decoration.
+    Returns up to 3 [{label, url, kind, caption}] for the gaps worth showing."""
+    pdp0 = (pdp_urls[0] if pdp_urls else base_url)
+    flags = merch.get("flags") or []
+    ev: List[dict] = []
+
+    if merch.get("default_sort") == "recency":
+        ev.append({"label": "sort", "url": pdp0, "kind": "sort",
+                   "caption": "Reviews default to ‘Most Recent’ sort — newest, not the most persuasive."})
+    if merch.get("low_star_up_top"):
+        ev.append({"label": "low_star", "url": pdp0, "kind": "reviews",
+                   "caption": "A 1–2★ review sits on the first screen of reviews."})
+    if any(("photo" in f.lower() or "ugc" in f.lower()) for f in flags):
+        ev.append({"label": "ugc", "url": pdp0, "kind": "gallery",
+                   "caption": "Off-message customer photos lead the review gallery."})
+    if scores.get("stars_on_category", {}).get("score", 1) == 0:
+        ev.append({"label": "category", "url": cat_url or base_url, "kind": "category",
+                   "caption": "Collection pages don’t show star ratings."})
+    llm = scores.get("llm_crawlability", {})
+    if llm.get("measured", True) and llm.get("score", 99) < llm.get("max_score", 20) * 0.5:
+        ev.append({"label": "ai_read", "url": pdp0, "kind": "reviews",
+                   "caption": "Reviews are on the page, but an AI assistant couldn’t read them accurately."})
+    bd = scores.get("bestseller_depth", {})
+    if bd.get("measured", True) and bd.get("score", 9) == 0:
+        ev.append({"label": "depth", "url": pdp0, "kind": "reviews",
+                   "caption": "Top products carry too few reviews to rank and convert."})
+
+    # One clean shot per page (most review findings share the same PDP); keep
+    # the first finding's caption for that page.
+    seen, out = set(), []
+    for e in ev:
+        if e["url"] in seen:
+            continue
+        seen.add(e["url"])
+        out.append(e)
+        if len(out) >= 3:
+            break
+    return out
+
+
 def _should_fallback_to_chrome(
     pdp_urls: list,
     pdp_htmls: list,
@@ -565,17 +607,10 @@ async def run_scan(
             _log("score_validation_complete",
                  scores_summary={k: v.get("score") for k, v in all_scores.items()})
 
-            # ── Screenshots ────────────────────────────────────────────────────
-            if not skip_screenshots:
-                await emit("screenshots", "running", message="Taking targeted screenshots...")
-                screenshots = await safe_run(
-                    "screenshots", auditor.take_screenshots(scan_id, base_url, pdp_urls), default=[]
-                ) or []
-                _log("screenshots_result", count=len(screenshots), paths=screenshots)
-                await emit("screenshots", "complete",
-                           message=f"{len(screenshots)} screenshots captured.", count=len(screenshots))
-            else:
-                await emit("screenshots", "complete", message="Screenshots skipped.", count=0)
+            # Screenshots are captured AFTER scoring (below) as evidence of the
+            # specific gaps we found — not generic page shots.
+            screenshots = []
+            cat_url_for_evidence = cat_url
 
         # ── Compute totals (outside Playwright context) ───────────────────────
         # Only count dimensions we could actually measure — never fabricate a
@@ -634,6 +669,24 @@ async def run_scan(
                 key=lambda x: x[1].get("score", 0) / max(x[1].get("max_score", 1), 1)
             )[:5]
         ]
+
+        # ── Evidence screenshots — proof of the gaps we found (negatives only) ─
+        if not skip_screenshots and os.environ.get("SCRAPFLY_KEY", "").strip():
+            evidence = _build_evidence(all_scores, merch, pdp_urls,
+                                       cat_url_for_evidence, base_url)
+            if evidence:
+                await emit("screenshots", "running", message="Capturing evidence...")
+                try:
+                    async with ScrapflyAuditor() as _ev:
+                        screenshots = await _ev.capture_evidence(scan_id, evidence)
+                except Exception as exc:
+                    log.warning("Evidence capture failed: %s", exc)
+                _log("evidence_screenshots", count=len(screenshots),
+                     labels=[s.get("label") for s in screenshots])
+                await emit("screenshots", "complete",
+                           message=f"{len(screenshots)} evidence shots.", count=len(screenshots))
+            else:
+                await emit("screenshots", "complete", message="No issues to screenshot.", count=0)
 
         # ── PDF ───────────────────────────────────────────────────────────────
         await emit("pdf", "running", message="Generating PDF brief...")
@@ -713,9 +766,8 @@ async def run_scan(
         # Normalize screenshot paths for frontend
         from pathlib import Path as _Path
         normalized_screenshots = [
-            {"label": _Path(p).stem, "path": p}
-            for p in screenshots
-            if isinstance(p, str)
+            (s if isinstance(s, dict) else {"label": _Path(s).stem, "path": s})
+            for s in screenshots
         ]
 
         full_result = {
