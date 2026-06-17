@@ -54,8 +54,7 @@ def score(pdp_htmls: List[str]) -> dict:
         return {
             "score": 0,
             "max_score": MAX_PTS,
-            "finding": f"Could not extract review counts from {total} PDPs. "
-                       "Reviews may require login or are not present.",
+            "finding": "Per-product review counts weren’t readable from the product pages.",
         }
 
     avg_count = sum(counts_found) // len(counts_found)

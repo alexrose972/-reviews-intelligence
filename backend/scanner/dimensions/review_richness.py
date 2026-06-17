@@ -17,7 +17,7 @@ def score(pdp_htmls: List[str]) -> dict:
         return {
             "score": 0,
             "max_score": MAX_PTS,
-            "finding": "No review text found on scanned PDPs.",
+            "finding": "No review text was readable on the product pages.",
         }
 
     word_counts = [len(r.split()) for r in all_reviews]

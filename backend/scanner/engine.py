@@ -520,61 +520,46 @@ async def run_scan(
                        score=vs["score"], max_score=vs["max_score"],
                        vertical=vertical)
 
-            # ── Score validation ───────────────────────────────────────────────
-            # If no real PDPs were found, PDP-dependent scores must not be fabricated
+            # ── Score validation — never fake a number or leak diagnostics ──────
+            # Anything we couldn't actually assess is marked 'measured: False'
+            # (excluded from the score, shown as 'Not measured') with brand-safe
+            # copy. No internal phrasing ("prevent fabrication", "require login",
+            # "scanned PDPs") ever reaches the UI or the client PDF.
             real_pdp_count = len([u for u in pdp_urls if u])
-            if real_pdp_count == 0:
-                log.warning("Score validation: no PDPs found — zeroing PDP-dependent scores")
-                for key in ["review_richness", "review_recency", "bestseller_depth"]:
-                    if all_scores.get(key, {}).get("score", 0) > 0:
-                        _log("score_validation", dimension=key, action="zeroed",
-                             reason="no_pdps_found",
-                             original_score=all_scores[key]["score"])
-                        all_scores[key]["score"] = 0
-                        all_scores[key]["finding"] = (
-                            "Could not access product pages — score zeroed to prevent fabrication."
-                        )
-
-            # If review text samples were empty across ALL PDPs, richness must be 0.
-            # `review_texts_found` is stored as a count in the audit log.
             total_review_texts = sum(
                 entry.get("review_texts_found", 0)
                 for entry in audit_log
                 if entry.get("step", "").startswith("pdp_review_audit_")
             )
-            if total_review_texts == 0 and all_scores.get("review_richness", {}).get("score", 0) > 0:
-                _log("score_validation", dimension="review_richness", action="zeroed",
-                     reason="no_review_text_extracted",
-                     original_score=all_scores["review_richness"]["score"])
-                all_scores["review_richness"]["score"] = 0
-                all_scores["review_richness"]["finding"] = (
-                    "No review text extracted from any PDP — score zeroed to prevent fabrication."
-                )
-
-            # If reviews demonstrably EXIST (AggregateRating schema) but their text/
-            # dates weren't in the page HTML (BazaarVoice & co. load them client-side),
-            # 0 is a false negative that lies and tanks the score. Mark them
-            # 'not measured from page' with neutral credit instead.
             reviews_exist = all_scores.get("rich_snippets", {}).get("score", 0) > 0
-            if reviews_exist:
-                rr = all_scores.get("review_richness")
-                if rr and rr.get("score", 0) == 0:
-                    rr["measured"] = False  # don't fake a number for what we couldn't read
-                    rr["finding"] = (
-                        "Review content loads via the on-site widget and isn't embedded in the page "
-                        "HTML, so depth couldn't be measured from the page."
-                    )
-                    _log("score_validation", dimension="review_richness", action="not_measured",
-                         reason="reviews_exist_text_not_in_html")
-                rc = all_scores.get("review_recency")
-                if rc and "could not extract" in (rc.get("finding", "") or "").lower():
-                    rc["measured"] = False
-                    rc["finding"] = (
-                        "Review dates load via the on-site widget and aren't embedded in the page "
-                        "HTML, so freshness couldn't be measured from the page."
-                    )
-                    _log("score_validation", dimension="review_recency", action="not_measured",
-                         reason="reviews_exist_dates_not_in_html")
+
+            def _not_measured(key, finding):
+                d = all_scores.get(key)
+                if d:
+                    d["measured"] = False
+                    d["finding"] = finding
+                    _log("score_validation", dimension=key, action="not_measured")
+
+            if real_pdp_count == 0:
+                # Couldn't reach product pages (e.g. a JS storefront we can't crawl).
+                msg = "Couldn’t assess on this scan — product pages weren’t reachable."
+                _not_measured("review_richness", msg)
+                _not_measured("review_recency", msg)
+                _not_measured("bestseller_depth", msg)
+            elif total_review_texts == 0 and reviews_exist:
+                # Reviews demonstrably exist (AggregateRating) but load via a widget.
+                _not_measured("review_richness",
+                    "Reviews load via the on-site widget and aren’t embedded in the page HTML, so depth couldn’t be read.")
+                _not_measured("review_recency",
+                    "Reviews load via the on-site widget and aren’t embedded in the page HTML, so freshness couldn’t be read.")
+                _not_measured("bestseller_depth",
+                    "Reviews load via the on-site widget, so per-product review counts couldn’t be read from the page.")
+            elif total_review_texts == 0:
+                # PDPs reached, no reviews + no schema — a genuine finding, not an error.
+                if all_scores.get("review_richness"):
+                    all_scores["review_richness"]["score"] = 0
+                    all_scores["review_richness"]["finding"] = "No on-site review content was detected."
+                _not_measured("review_recency", "No on-site reviews were detected to assess freshness.")
 
             _log("score_validation_complete",
                  scores_summary={k: v.get("score") for k, v in all_scores.items()})

@@ -22,7 +22,7 @@ def score(pdp_htmls: List[str]) -> dict:
         return {
             "score": 3,
             "max_score": MAX_PTS,
-            "finding": "Could not extract review dates from visible reviews.",
+            "finding": "Review dates weren’t readable on the product pages.",
         }
 
     most_recent = max(all_dates)
