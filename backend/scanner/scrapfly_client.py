@@ -24,6 +24,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .browser import PDP_PATH_RE, SHOP_PATH_RE, BESTSELLER_KEYWORDS, SS_BASE, detect_block
+from .utils import extract_jsonld_reviews
 
 log = logging.getLogger("scanner.scrapfly")
 
@@ -282,6 +283,27 @@ def extract_reviews_from_html(html: str) -> dict:
     data["has_videos"] = bool(soup.select_one('[class*="review-video" i]'))
     data["has_ai_summary"] = bool(soup.select_one(
         '[class*="ai-summary" i], [class*="review-summary" i], [class*="ai-insights" i]'))
+
+    # ── JSON-LD reviews (BazaarVoice/Yotpo/Okendo embed real reviews as structured
+    # data even when the visible widget loads via JS). Most reliable text source. ──
+    jsonld_reviews = extract_jsonld_reviews(soup)
+    if jsonld_reviews:
+        _seen = set(data["review_texts"])
+        for r in jsonld_reviews:
+            t = (r.get("text") or "").strip()
+            if len(t) > 20 and t not in _seen:
+                _seen.add(t)
+                data["review_texts"].append(t[:300])
+            if r.get("date"):
+                data["dates"].append(str(r["date"])[:30])
+            rv = r.get("rating")
+            if rv is not None:
+                data["star_ratings"].append(str(rv))
+            if r.get("images"):
+                data["has_photos"] = True
+            if r.get("videos"):
+                data["has_videos"] = True
+        data["jsonld_review_count"] = len(jsonld_reviews)
     return data
 
 

@@ -220,6 +220,74 @@ def has_microdata_rating(soup: BeautifulSoup) -> bool:
     return bool(soup.find(attrs={"itemprop": "aggregateRating"}))
 
 
+def _norm_jsonld_review(o: dict) -> Optional[dict]:
+    """Normalize one JSON-LD Review node to {text, headline, rating, date, images, videos}."""
+    if not isinstance(o, dict):
+        return None
+    body = o.get("reviewBody") or o.get("description") or ""
+    headline = o.get("headline") or o.get("name") or ""
+    if not (isinstance(body, str) and body.strip()) and not (isinstance(headline, str) and headline.strip()):
+        return None
+    rr = o.get("reviewRating") or o.get("ratingValue")
+    rating = None
+    if isinstance(rr, dict):
+        rating = rr.get("ratingValue")
+    elif isinstance(rr, (str, int, float)):
+        rating = rr
+    img = o.get("image") or []
+    vid = o.get("video") or []
+    return {
+        "text": (body or "").strip(),
+        "headline": (headline or "").strip(),
+        "rating": rating,
+        "date": o.get("datePublished") or o.get("dateCreated") or "",
+        "images": img if isinstance(img, list) else ([img] if img else []),
+        "videos": vid if isinstance(vid, list) else ([vid] if vid else []),
+    }
+
+
+def extract_jsonld_reviews(soup: BeautifulSoup) -> List[dict]:
+    """Pull individual reviews from JSON-LD blocks (BazaarVoice, Yotpo, Okendo, etc.).
+
+    These platforms embed the first page of reviews as structured data
+    (e.g. <script type="application/ld+json" id="bv-jsonld-reviews-data">{"review":[...]}</script>)
+    even when the visible widget loads later via JS — so this is the most reliable
+    source of real review text/dates/media we have, with no rendering required.
+    """
+    reviews: List[dict] = []
+    seen = set()
+
+    def _collect(node):
+        if isinstance(node, list):
+            for x in node:
+                _collect(x)
+            return
+        if not isinstance(node, dict):
+            return
+        t = node.get("@type", "")
+        is_review = (isinstance(t, str) and t in ("Review", "UserReview")) or \
+                    (isinstance(t, list) and any(x in ("Review", "UserReview") for x in t)) or \
+                    ("reviewBody" in node)  # BV review items carry reviewBody but no per-item @type
+        if is_review:
+            r = _norm_jsonld_review(node)
+            if r:
+                key = (r["text"] or r["headline"])[:120]
+                if key and key not in seen:
+                    seen.add(key)
+                    reviews.append(r)
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                _collect(v)
+
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            obj = json.loads(tag.string or "")
+        except Exception:
+            continue
+        _collect(obj)
+    return reviews
+
+
 def extract_review_texts(soup: BeautifulSoup) -> List[str]:
     selectors = [
         "[itemprop='reviewBody']", "[class*='review-body']", "[class*='review-text']",
@@ -234,6 +302,12 @@ def extract_review_texts(soup: BeautifulSoup) -> List[str]:
             if len(t) > 10 and t not in seen:
                 seen.add(t)
                 texts.append(t)
+    # Supplement with JSON-LD review bodies (reliable where the widget loads via JS).
+    for r in extract_jsonld_reviews(soup):
+        t = r.get("text") or ""
+        if len(t) > 10 and t not in seen:
+            seen.add(t)
+            texts.append(t)
     return texts
 
 
@@ -247,6 +321,10 @@ def extract_review_dates(soup: BeautifulSoup) -> List[str]:
         d = tag.get_text(strip=True)
         if d:
             dates.append(d)
+    # JSON-LD review dates (ISO timestamps), reliable across review platforms.
+    for r in extract_jsonld_reviews(soup):
+        if r.get("date"):
+            dates.append(str(r["date"]))
     return dates
 
 
@@ -257,6 +335,15 @@ def parse_date(s: str) -> Optional[datetime]:
     s = (s or "").strip()
     if not s:
         return None
+    # ISO 8601 fast path — handles timestamps with millis/timezone offsets
+    # (JSON-LD review dates like "2026-06-17T14:00:39.000+00:00"). Date precision
+    # is enough for "days old" freshness scoring.
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            pass
     # Absolute formats
     for fmt in ["%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%d/%m/%Y",
                 "%m/%d/%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"]:
