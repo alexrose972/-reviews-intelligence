@@ -590,13 +590,19 @@ async def run_scan(
                 _not_measured("review_recency", msg)
                 _not_measured("bestseller_depth", msg)
             elif total_review_texts == 0 and reviews_exist:
-                # Reviews demonstrably exist (AggregateRating) but load via a widget.
+                # Reviews demonstrably exist (AggregateRating) but the text loads via a
+                # widget. Depth/freshness need the review *text* (unreadable here), so
+                # mark those Not measured. But bestseller_depth runs on per-product
+                # review *counts*, which we DO read from the microdata snapshot — so we
+                # only hide it when no counts were actually found.
                 _not_measured("review_richness",
                     "Reviews load via the on-site widget and aren’t embedded in the page HTML, so depth couldn’t be read.")
                 _not_measured("review_recency",
                     "Reviews load via the on-site widget and aren’t embedded in the page HTML, so freshness couldn’t be read.")
-                _not_measured("bestseller_depth",
-                    "Reviews load via the on-site widget, so per-product review counts couldn’t be read from the page.")
+                bd = all_scores.get("bestseller_depth")
+                if not (bd and bd.get("review_counts_found")):
+                    _not_measured("bestseller_depth",
+                        "Reviews load via the on-site widget, so per-product review counts couldn’t be read from the page.")
             elif total_review_texts == 0:
                 # PDPs reached, no reviews + no schema — a genuine finding, not an error.
                 if all_scores.get("review_richness"):

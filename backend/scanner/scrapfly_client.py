@@ -227,13 +227,16 @@ def extract_reviews_from_html(html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
     count_sels = [
-        '[class*="review-count" i]', '[class*="reviewCount" i]', '[itemprop="reviewCount"]',
+        '[itemprop="reviewCount"]', '[itemprop="ratingCount"]',  # microdata (BazaarVoice etc.)
+        '[class*="review-count" i]', '[class*="reviewCount" i]',
         '[class*="total-reviews" i]', '[class*="rating-count" i]', '[class*="reviews-total" i]',
     ]
     for sel in count_sels:
         el = soup.select_one(sel)
         if el:
-            m = re.search(r"([\d,]+)", el.get_text(" ", strip=True))
+            # Microdata puts the value in `content`; widgets put it in the text.
+            v = el.get("content") or el.get_text(" ", strip=True)
+            m = re.search(r"([\d,]+)", v or "")
             if m:
                 data["review_count"] = int(m.group(1).replace(",", ""))
                 break

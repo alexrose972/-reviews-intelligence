@@ -154,21 +154,21 @@ def render_html(
         </div>"""
 
     # ── Detailed findings (sanitized) ─────────────────────────────────────────
+    # Client-facing: only show dimensions we actually measured. Anything we
+    # couldn't assess is omitted entirely (it stays in the internal web report).
     dim_rows = ""
-    for i, key in enumerate(DIMENSION_ORDER):
+    measured_keys = [k for k in DIMENSION_ORDER
+                     if k in scores and scores[k].get("measured", True)]
+    for i, key in enumerate(measured_keys):
         dim = scores.get(key, {})
         s = dim.get("score", 0)
         m = dim.get("max_score", 0) or 1
-        measured = dim.get("measured", True)
         row_bg = "#F6F6F7" if i % 2 == 1 else "#FFFFFF"
         finding = _client_finding(key, dim.get("finding", ""), has_reviews)
-        if measured:
-            pct = min(s / m * 100, 100)
-            bar = "#16a34a" if pct >= 70 else ("#f59e0b" if pct >= 40 else "#ef4444")
-            score_cell = (f'<div class="bw"><div class="b" style="width:{pct:.0f}%;background:{bar}"></div></div>'
-                          f'<span class="sn">{s:.0f}/{m}</span>')
-        else:
-            score_cell = '<span class="na">Not measured</span>'
+        pct = min(s / m * 100, 100)
+        bar = "#16a34a" if pct >= 70 else ("#f59e0b" if pct >= 40 else "#ef4444")
+        score_cell = (f'<div class="bw"><div class="b" style="width:{pct:.0f}%;background:{bar}"></div></div>'
+                      f'<span class="sn">{s:.0f}/{m}</span>')
         dim_rows += f"""
         <tr style="background:{row_bg}">
           <td class="dn"><strong>{_esc(DIMENSION_LABELS.get(key, key))}</strong><span class="why">{_esc(WHY_IT_MATTERS.get(key, ''))}</span></td>

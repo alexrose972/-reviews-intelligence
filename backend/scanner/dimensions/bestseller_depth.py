@@ -28,12 +28,14 @@ def score(pdp_htmls: List[str]) -> dict:
         # Try specific review-count elements first
         count = None
         for el in soup.select(
+            "[itemprop='reviewCount'], [itemprop='ratingCount'], "
             "[class*='review-count' i], [class*='reviewCount' i], "
-            "[itemprop='reviewCount'], [class*='total-reviews' i], "
+            "[class*='total-reviews' i], "
             "[class*='rating-count' i], [class*='bv-rating-count' i]"
         ):
-            raw = el.get_text(strip=True)
-            m = re.search(r"([\d,]+)", raw)
+            # Microdata (BazaarVoice etc.) puts the value in `content`, not text.
+            raw = el.get("content") or el.get_text(strip=True)
+            m = re.search(r"([\d,]+)", raw or "")
             if m:
                 count = int(m.group(1).replace(",", ""))
                 break
@@ -54,6 +56,7 @@ def score(pdp_htmls: List[str]) -> dict:
         return {
             "score": 0,
             "max_score": MAX_PTS,
+            "review_counts_found": 0,
             "finding": "Per-product review counts weren’t readable from the product pages.",
         }
 
@@ -62,6 +65,7 @@ def score(pdp_htmls: List[str]) -> dict:
     return {
         "score": round(MAX_PTS * ratio, 1),
         "max_score": MAX_PTS,
+        "review_counts_found": len(counts_found),
         "finding": (
             f"{products_with_50plus}/{total} top products have 50+ reviews "
             f"(avg {avg_count} reviews). "
