@@ -262,14 +262,20 @@ def detect_review_platform(html: str) -> Optional[str]:
 
 
 def find_review_iframe_src(html: str) -> Optional[str]:
-    """Return the src of a review-platform iframe if one is present in the page."""
+    """Return the src of a review-platform iframe if one is present in the page.
+
+    Matches a real review-platform marker or a 'reviews' path segment — NOT a bare
+    'review' substring, which false-matches things like 'gtm_preview' on a Google
+    Tag Manager iframe.
+    """
     if not html:
         return None
     soup = BeautifulSoup(html, "lxml")
     for ifr in soup.find_all("iframe"):
         src = ifr.get("src") or ifr.get("data-src") or ""
         low = src.lower()
-        if any(p in low for p in REVIEW_PLATFORM_MARKERS) or "review" in low:
+        if any(p in low for p in REVIEW_PLATFORM_MARKERS) or \
+                re.search(r"(^|[/_.-])reviews?([/_.?=&-]|$)", low):
             if src.startswith("//"):
                 src = "https:" + src
             return src

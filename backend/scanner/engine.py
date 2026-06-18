@@ -575,7 +575,23 @@ async def run_scan(
                 for entry in audit_log
                 if entry.get("step", "").startswith("pdp_review_audit_")
             )
-            reviews_exist = all_scores.get("rich_snippets", {}).get("score", 0) > 0
+            # "Reviews demonstrably exist" must be broader than schema alone.
+            # PowerReviews / BazaarVoice etc. frequently expose NO server-side
+            # AggregateRating, yet the brand clearly runs a review program (the
+            # platform widget is on the page, a review count is visible, a dedicated
+            # reviews page exists). In that case we must NEVER tell the prospect
+            # "no review content" — the text just loads via a JS widget we can't read.
+            max_review_count = max(
+                [entry.get("review_count") or 0 for entry in audit_log
+                 if entry.get("step", "").startswith("pdp_review_audit_")] or [0]
+            )
+            review_platform_present = bool(pdp_htmls and detect_review_platform(pdp_htmls[0]))
+            reviews_present = (
+                all_scores.get("rich_snippets", {}).get("score", 0) > 0
+                or review_platform_present
+                or max_review_count > 0
+                or bool(reviews_page_html)
+            )
 
             def _not_measured(key, finding):
                 d = all_scores.get(key)
@@ -590,22 +606,21 @@ async def run_scan(
                 _not_measured("review_richness", msg)
                 _not_measured("review_recency", msg)
                 _not_measured("bestseller_depth", msg)
-            elif total_review_texts == 0 and reviews_exist:
-                # Reviews demonstrably exist (AggregateRating) but the text loads via a
-                # widget. Depth/freshness need the review *text* (unreadable here), so
-                # mark those Not measured. But bestseller_depth runs on per-product
-                # review *counts*, which we DO read from the microdata snapshot — so we
-                # only hide it when no counts were actually found.
+            elif total_review_texts == 0 and reviews_present:
+                # Reviews demonstrably exist (schema, a review platform/widget, a
+                # visible count, or a dedicated reviews page) but the text loads via a
+                # JS widget we couldn't read. Everything that needs the review text or
+                # a trustworthy per-product depth read is marked Not measured (and
+                # omitted from the client PDF) — never a false "no reviews" zero.
                 _not_measured("review_richness",
                     "Reviews load via the on-site widget and aren’t embedded in the page HTML, so depth couldn’t be read.")
                 _not_measured("review_recency",
                     "Reviews load via the on-site widget and aren’t embedded in the page HTML, so freshness couldn’t be read.")
-                bd = all_scores.get("bestseller_depth")
-                if not (bd and bd.get("review_counts_found")):
-                    _not_measured("bestseller_depth",
-                        "Reviews load via the on-site widget, so per-product review counts couldn’t be read from the page.")
+                _not_measured("bestseller_depth",
+                    "Reviews load via the on-site widget, so per-product review depth couldn’t be read reliably.")
             elif total_review_texts == 0:
-                # PDPs reached, no reviews + no schema — a genuine finding, not an error.
+                # PDPs reached, NO reviews + NO schema + NO platform + NO reviews page —
+                # a genuine finding (the brand really has little/no on-site reviews).
                 if all_scores.get("review_richness"):
                     all_scores["review_richness"]["score"] = 0
                     all_scores["review_richness"]["finding"] = "No on-site review content was detected."
