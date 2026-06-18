@@ -246,6 +246,36 @@ def _norm_jsonld_review(o: dict) -> Optional[dict]:
     }
 
 
+REVIEW_PLATFORM_MARKERS = [
+    "bazaarvoice", "bvstatic", "bv.com", "powerreviews", "okendo",
+    "yotpo", "stamped", "reviews.io", "feefo", "junip", "loox", "trustpilot",
+]
+
+
+def detect_review_platform(html: str) -> Optional[str]:
+    """Return the first review platform whose marker appears in the page, else None."""
+    low = (html or "").lower()
+    for p in REVIEW_PLATFORM_MARKERS:
+        if p in low:
+            return p
+    return None
+
+
+def find_review_iframe_src(html: str) -> Optional[str]:
+    """Return the src of a review-platform iframe if one is present in the page."""
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "lxml")
+    for ifr in soup.find_all("iframe"):
+        src = ifr.get("src") or ifr.get("data-src") or ""
+        low = src.lower()
+        if any(p in low for p in REVIEW_PLATFORM_MARKERS) or "review" in low:
+            if src.startswith("//"):
+                src = "https:" + src
+            return src
+    return None
+
+
 def extract_jsonld_reviews(soup: BeautifulSoup) -> List[dict]:
     """Pull individual reviews from JSON-LD blocks (BazaarVoice, Yotpo, Okendo, etc.).
 

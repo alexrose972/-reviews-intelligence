@@ -555,3 +555,15 @@ class ScrapflyAuditor:
                 except Exception as exc:
                     log.warning("Evidence shot save failed [%s]: %s", shot.get("label"), exc)
         return out
+
+    async def screenshot_bytes(self, url: str) -> Optional[bytes]:
+        """Raw full-page screenshot bytes for `url` (popup-free, lazy images loaded).
+        The vision fallback crops this to the review band before reading it
+        (Scrapfly's viewport capture ignores js scroll and frames the page top, so
+        full-page + crop is the only way to reliably frame the reviews). None on failure."""
+        try:
+            res = await scrapfly_scrape(self._client, url, render=True, screenshot=True)
+            return res.get("screenshot")
+        except Exception as exc:
+            log.warning("screenshot_bytes failed [%s]: %s", url, exc)
+            return None

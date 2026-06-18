@@ -14,13 +14,14 @@ from ..database import AsyncSessionLocal, ScanRun
 from .utils import (
     SCORE_WEIGHTS, VERTICAL_PLAYS, WHY_IT_MATTERS, DIMENSION_LABELS,
     make_client, fetch_html, detect_platform, detect_vertical,
-    domain_to_url, clean_domain,
+    domain_to_url, clean_domain, detect_review_platform, find_review_iframe_src,
 )
 from .browser import PlaywrightAuditor, detect_block
 from .branding import fetch_brand_logo
 from .scrapfly_client import ScrapflyAuditor
 from .merchandising import analyze as analyze_merchandising, extract_ugc_image_urls
 from .vision_ugc import check_ugc_quality
+from .vision_reviews import analyze_review_screenshot, apply_vision_review
 from .dimensions import (
     llm_crawlability, review_richness, review_recency,
     visibility, rich_snippets, page_speed,
@@ -612,6 +613,34 @@ async def run_scan(
 
             _log("score_validation_complete",
                  scores_summary={k: v.get("score") for k, v in all_scores.items()})
+
+            # ── Vision fallback for review extraction ─────────────────────────
+            # When DOM + JSON-LD found NO review text but a review platform is on
+            # the page, the reviews are loading via a JS widget/iframe. A
+            # screenshot captures whatever rendered; Claude vision reads it. Fires
+            # ONLY on genuine extraction failures (not every PDP) to bound cost,
+            # and always uses the STATED count, never a tally of visible cards.
+            pdp_for_vision = next((u for u in pdp_urls if u), None)
+            review_platform = detect_review_platform(pdp_htmls[0]) if pdp_htmls else None
+            if (total_review_texts == 0 and review_platform and pdp_for_vision
+                    and not skip_llm and os.environ.get("ANTHROPIC_API_KEY")
+                    and os.environ.get("REVIEW_VISION_FALLBACK", "true").lower() == "true"):
+                iframe_src = find_review_iframe_src(pdp_htmls[0])
+                shot_target = iframe_src or pdp_for_vision  # iframe renders standalone
+                await emit("review_richness", "running",
+                           message="Reviews load via a widget — visually inspecting the page...")
+                shot = await safe_run("review_vision_capture",
+                                      auditor.screenshot_bytes(shot_target), default=None)
+                vision_review = None
+                if shot:
+                    vision_review = await safe_run(
+                        "review_vision_analyze",
+                        analyze_review_screenshot(shot, brand_name), default=None)
+                summary = apply_vision_review(all_scores, vision_review, brand_name) if vision_review else {}
+                _log("vision_fallback",
+                     url=pdp_for_vision, platform_detected=review_platform,
+                     iframe_found=bool(iframe_src), screenshot_captured=bool(shot),
+                     result=vision_review, applied=summary, cost_note="1 vision API call")
 
             # Screenshots are captured AFTER scoring (below) as evidence of the
             # specific gaps we found — not generic page shots.
