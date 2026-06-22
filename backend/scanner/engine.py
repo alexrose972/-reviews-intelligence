@@ -354,12 +354,31 @@ async def run_scan(
             # do NOT score it — a fabricated grade off a block page is worse than
             # no grade. Mark the scan 'blocked' and queue a Browser Scan instead.
             block_reason = detect_block(homepage_html)
+            using_scrapfly = bool(os.environ.get("SCRAPFLY_KEY", "").strip())
+
+            # Scrapfly: the homepage is a site's MOST-protected page and the anti-bot
+            # bypass is probabilistic, so a transient homepage challenge must NOT kill
+            # a scan when the product pages (already discovered via sitemap in Phase 1)
+            # are reachable — those are what the review dimensions actually need. Probe
+            # a PDP before giving up; if one renders clean, proceed using it as the
+            # homepage stand-in for platform/logo/visibility signals.
+            if block_reason and using_scrapfly and any(pdp_urls):
+                for cand in [u for u in pdp_urls if u][:3]:
+                    probe = await safe_run("homepage_block_pdp_probe", auditor.get_html(cand))
+                    if probe and not detect_block(probe):
+                        log.info("Scan %s: homepage blocked (%s) but PDP reachable — "
+                                 "proceeding via product pages", scan_id, block_reason)
+                        _log("homepage_blocked_pdp_fallback", reason=block_reason,
+                             pdp=cand, html_len=len(probe))
+                        homepage_html = probe
+                        block_reason = None
+                        break
+
             if block_reason:
                 # Retry once through a residential proxy before giving up — most
                 # datacenter-IP blocks clear when the request comes from a
                 # residential IP. Only paid bandwidth is spent on blocked sites.
                 proxy_url = os.environ.get("PROXY_URL", "").strip()
-                using_scrapfly = bool(os.environ.get("SCRAPFLY_KEY", "").strip())
                 if proxy_url and not use_proxy and not using_scrapfly:
                     log.info("Scan %s blocked (%s) — retrying via residential proxy",
                              scan_id, block_reason)
