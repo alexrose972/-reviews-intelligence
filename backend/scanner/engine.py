@@ -472,6 +472,18 @@ async def run_scan(
 
             _log("pdp_phase_complete", pdps_rendered=len(pdp_htmls))
 
+            # Some storefronts only expose their review-platform markers on PDPs, not
+            # the homepage (Wolverine, Brooklinen, Gymshark in testing). Backfill the
+            # detected platform from a product page so the brief never shows a blank
+            # "Current reviews platform."
+            if not detected_platform:
+                for h in pdp_htmls:
+                    p = detect_platform(h)
+                    if p:
+                        detected_platform = p
+                        _log("platform_backfilled_from_pdp", platform=p)
+                        break
+
             # ── Phase 4: Category page ────────────────────────────────────────
             await emit("stars_on_category", "running", message="Rendering category page...")
             cat_url, cat_html = await safe_run(

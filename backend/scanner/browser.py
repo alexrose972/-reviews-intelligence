@@ -119,7 +119,9 @@ _BLOCK_SIGNATURES = [
     "checking your browser before accessing",
     "cf-browser-verification",
     "cf-challenge",
-    "challenge-platform",
+    # NOTE: bare "challenge-platform" removed — it false-matches Cloudflare Turnstile
+    # (a legit CAPTCHA widget many sites embed on signup forms) on perfectly reachable
+    # pages. Real CF challenges are still caught by "/cdn-cgi/challenge" + "_cf_chl_".
     "_cf_chl_",
     "attention required! | cloudflare",
     "/cdn-cgi/challenge",

@@ -67,9 +67,9 @@ def score(pdp_htmls: List[str]) -> dict:
         "max_score": MAX_PTS,
         "review_counts_found": len(counts_found),
         "finding": (
-            f"{products_with_50plus}/{total} top products have 50+ reviews "
-            f"(avg {avg_count} reviews). "
+            f"{products_with_50plus}/{total} of the product pages we reviewed have "
+            f"50+ reviews (avg {avg_count}). "
             + ("Strong review depth." if ratio >= 0.8 else
-               "Most top SKUs need more reviews to rank and convert.")
+               "Several of these products would convert better with more reviews.")
         ),
     }
