@@ -687,7 +687,7 @@ async def run_scan(
         # reviews that load via a widget). The score rescales to what's measured.
         _measured = [d for d in all_scores.values() if d.get("measured", True)]
         _m_max = sum(d.get("max_score", 0) for d in _measured) or 1
-        total = round(sum(d["score"] for d in _measured) / _m_max * 100, 1)
+        total = round(sum(d.get("score", 0) or 0 for d in _measured) / _m_max * 100, 1)
         grade = compute_grade(total)
         platform_mismatch = bool(
             detected_platform and sf_reviews_provider and
@@ -696,7 +696,12 @@ async def run_scan(
 
         # Review-merchandising audit (Most-Recent sort, low-star review up top,
         # UGC gallery) — conversion signals that map straight to Yotpo Smart Sort.
-        merch = analyze_merchandising(pdp_htmls, reviews_page_html)
+        # Non-critical: a parse failure here must never sink an already-scored scan.
+        try:
+            merch = analyze_merchandising(pdp_htmls, reviews_page_html)
+        except Exception as exc:
+            log.warning("Merchandising audit failed (non-fatal): %s", exc)
+            merch = {}
 
         # Visual UGC curation: judge the first gallery photos with Claude vision.
         if (merch.get("has_ugc_gallery") and not skip_llm
@@ -725,11 +730,15 @@ async def run_scan(
                  low_star_up_top=merch.get("low_star_up_top"),
                  has_ugc_gallery=merch.get("has_ugc_gallery"))
 
-        pitch_angles = build_pitch_angles(
-            brand_name, all_scores, detected_platform, sf_reviews_provider,
-            platform_mismatch, llm_review_quote, llm_failed, vertical, vertical_play,
-            merch_flags=merch.get("flags"), page_speed_score=page_speed_score,
-        )
+        try:
+            pitch_angles = build_pitch_angles(
+                brand_name, all_scores, detected_platform, sf_reviews_provider,
+                platform_mismatch, llm_review_quote, llm_failed, vertical, vertical_play,
+                merch_flags=merch.get("flags"), page_speed_score=page_speed_score,
+            )
+        except Exception as exc:
+            log.warning("Pitch-angle build failed (non-fatal): %s", exc)
+            pitch_angles = []
 
         recommendations = [
             f"[{DIMENSION_LABELS.get(k, k)}] {v.get('finding', '')} — {WHY_IT_MATTERS.get(k, '')}"
@@ -789,22 +798,29 @@ async def run_scan(
 
         # ── Slinger 3000 ──────────────────────────────────────────────────────
         await emit("slinger", "running", message="Drafting Slinger 3000 emails...")
-        context_str = build_context(
-            brand_name=brand_name,
-            domain=clean_domain(base_url),
-            overall_score=int(total),
-            grade=grade,
-            scores=all_scores,
-            pitch_angles=pitch_angles,
-            detected_platform=detected_platform,
-            sf_platform=sf_reviews_provider,
-            platform_mismatch=platform_mismatch,
-            vertical=vertical,
-            page_speed_score=page_speed_score,
-            llm_quote=llm_review_quote,
-            llm_failed=llm_failed,
-        )
-        slinger_result = generate_drafts(brand_name, context_str, email_count=3)
+        # Outreach drafts are a bonus, not the deliverable. An LLM hiccup here must
+        # NOT fail a scan that already has a score + PDF — degrade to no drafts.
+        slinger_result = []
+        try:
+            context_str = build_context(
+                brand_name=brand_name,
+                domain=clean_domain(base_url),
+                overall_score=int(total),
+                grade=grade,
+                scores=all_scores,
+                pitch_angles=pitch_angles,
+                detected_platform=detected_platform,
+                sf_platform=sf_reviews_provider,
+                platform_mismatch=platform_mismatch,
+                vertical=vertical,
+                page_speed_score=page_speed_score,
+                llm_quote=llm_review_quote,
+                llm_failed=llm_failed,
+            )
+            slinger_result = generate_drafts(brand_name, context_str, email_count=3)
+        except Exception as exc:
+            log.warning("Slinger drafts failed (non-fatal): %s", exc)
+            _log("slinger_failed", error=str(exc))
         _log("slinger_complete", drafts_count=len(slinger_result) if slinger_result else 0)
         await emit("slinger", "complete", message="Slinger 3000 drafts ready.")
 
