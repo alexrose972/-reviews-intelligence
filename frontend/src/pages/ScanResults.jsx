@@ -354,7 +354,7 @@ export default function ScanResults() {
 
             {/* Slinger drafts */}
             {scan.slinger_drafts && (
-              <SlingerDrafts drafts={scan.slinger_drafts} />
+              <SlingerDrafts drafts={scan.slinger_drafts} scanId={id} />
             )}
           </div>
         )}

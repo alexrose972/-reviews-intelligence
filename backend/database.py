@@ -101,6 +101,24 @@ class User(Base):
     profile_photo = Column(Text)
     first_seen = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
+    gmail_refresh_token = Column(Text)  # stored after Gmail OAuth connect
+
+
+class EmailSend(Base):
+    """Log of emails sent via Slinger 3000."""
+    __tablename__ = "email_sends"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scan_id = Column(UUID(as_uuid=True), ForeignKey("scan_runs.id"), nullable=False)
+    sent_by = Column(Text, nullable=False)   # user email
+    sent_at = Column(DateTime, default=datetime.utcnow)
+    to_email = Column(Text, nullable=False)
+    to_name = Column(Text)
+    subject = Column(Text)
+    body = Column(Text)
+    gmail_message_id = Column(Text)
+    status = Column(Text, default="sent")    # sent | failed
+    error = Column(Text)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -142,3 +160,21 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS scan_fallback_reason TEXT DEFAULT NULL"
         ))
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_refresh_token TEXT DEFAULT NULL"
+        ))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS email_sends (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                scan_id UUID REFERENCES scan_runs(id),
+                sent_by TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT NOW(),
+                to_email TEXT NOT NULL,
+                to_name TEXT,
+                subject TEXT,
+                body TEXT,
+                gmail_message_id TEXT,
+                status TEXT DEFAULT 'sent',
+                error TEXT
+            )
+        """))

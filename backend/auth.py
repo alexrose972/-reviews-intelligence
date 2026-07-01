@@ -22,7 +22,6 @@ ALLOWED_DOMAIN = "yotpo.com"
 def _redirect_uri() -> str:
     if uri := os.environ.get("GOOGLE_REDIRECT_URI"):
         return uri
-    # Auto-build from Railway's injected domain
     if domain := os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
         return f"https://{domain}/auth/callback"
     return "http://localhost:8080/auth/callback"
@@ -31,6 +30,7 @@ def _redirect_uri() -> str:
 def get_google_auth_url(request: Request) -> str:
     state = secrets.token_urlsafe(16)
     request.session["oauth_state"] = state
+    request.session.pop("oauth_type", None)  # login flow — not gmail
     params = {
         "client_id":     os.environ["GOOGLE_CLIENT_ID"],
         "redirect_uri":  _redirect_uri(),
@@ -43,14 +43,31 @@ def get_google_auth_url(request: Request) -> str:
     return GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode(params)
 
 
+def get_gmail_auth_url(request: Request) -> str:
+    """Start a Gmail-scope OAuth flow. Reuses /auth/callback; oauth_type=gmail in session."""
+    state = secrets.token_urlsafe(16)
+    request.session["oauth_state"] = state
+    request.session["oauth_type"] = "gmail"
+    params = {
+        "client_id":     os.environ["GOOGLE_CLIENT_ID"],
+        "redirect_uri":  _redirect_uri(),
+        "response_type": "code",
+        "scope":         "openid email profile https://www.googleapis.com/auth/gmail.send",
+        "access_type":   "offline",
+        "state":         state,
+        "prompt":        "consent",  # always re-consent so we always get refresh_token
+    }
+    return GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode(params)
+
+
 async def handle_oauth_callback(code: str, state: str, request: Request, db: AsyncSession) -> User:
-    # CSRF check
     expected_state = request.session.pop("oauth_state", None)
     if not expected_state or expected_state != state:
         raise HTTPException(400, "Invalid OAuth state")
 
+    oauth_type = request.session.pop("oauth_type", "login")
+
     async with httpx.AsyncClient() as client:
-        # Exchange code for tokens
         token_resp = await client.post(
             GOOGLE_TOKEN_URL,
             data={
@@ -65,7 +82,6 @@ async def handle_oauth_callback(code: str, state: str, request: Request, db: Asy
             raise HTTPException(400, "Failed to exchange OAuth code")
         tokens = token_resp.json()
 
-        # Get user info
         user_resp = await client.get(
             GOOGLE_USER_URL,
             headers={"Authorization": f"Bearer {tokens['access_token']}"},
@@ -78,19 +94,21 @@ async def handle_oauth_callback(code: str, state: str, request: Request, db: Asy
     if not email.lower().endswith(f"@{ALLOWED_DOMAIN}"):
         raise HTTPException(403, f"Access restricted to @{ALLOWED_DOMAIN} accounts only.")
 
-    # Upsert user
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
     if user:
         user.last_seen = datetime.utcnow()
         user.name = guser.get("name", user.name)
         user.profile_photo = guser.get("picture", user.profile_photo)
+        if oauth_type == "gmail" and tokens.get("refresh_token"):
+            user.gmail_refresh_token = tokens["refresh_token"]
     else:
         user = User(
             email=email,
             name=guser.get("name", ""),
             google_id=guser.get("id", ""),
             profile_photo=guser.get("picture", ""),
+            gmail_refresh_token=tokens.get("refresh_token") if oauth_type == "gmail" else None,
         )
         db.add(user)
 

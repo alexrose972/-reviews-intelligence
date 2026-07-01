@@ -20,11 +20,13 @@ from pydantic import BaseModel
 from sqlalchemy import desc, select
 from starlette.middleware.sessions import SessionMiddleware
 
-from .auth import get_google_auth_url, handle_oauth_callback, require_auth
-from .database import AsyncSessionLocal, ChromeJob, ScanRun, User, init_db
+from .auth import get_google_auth_url, get_gmail_auth_url, handle_oauth_callback, require_auth
+from .database import AsyncSessionLocal, ChromeJob, EmailSend, ScanRun, User, init_db
 from .scanner.engine import run_scan
 from .scanner.branding import fetch_brand_logo
 from .sf_client import search_sf_accounts
+from .sf_contacts import get_contacts_for_brand
+from .gmail_client import send_email as gmail_send
 from .chrome_converter import ChromeAuditData, chrome_data_to_signals, score_from_chrome_data
 from .chrome_processor import chrome_job_processor, queue_chrome_job
 
@@ -111,6 +113,8 @@ async def auth_callback(request: Request, code: str = "", state: str = "", error
         return RedirectResponse(f"/login?error={error}")
     if not code:
         return RedirectResponse("/login?error=no_code")
+    oauth_type = request.session.get("oauth_type", "login")
+    return_to = request.session.pop("oauth_return_to", "/")
     try:
         async with AsyncSessionLocal() as db:
             user = await handle_oauth_callback(code, state, request, db)
@@ -119,12 +123,23 @@ async def auth_callback(request: Request, code: str = "", state: str = "", error
             "email": user.email,
             "name": user.name,
             "photo": user.profile_photo,
+            "gmail_connected": bool(user.gmail_refresh_token),
         }
+        if oauth_type == "gmail":
+            return RedirectResponse(return_to + "?gmail=connected")
         return RedirectResponse("/")
     except HTTPException as e:
         if e.status_code == 403:
             return RedirectResponse("/login?error=domain")
         return RedirectResponse(f"/login?error=oauth")
+
+
+@app.get("/auth/gmail")
+async def auth_gmail(request: Request, return_to: str = "/", user: dict = Depends(require_auth)):
+    """Start Gmail OAuth flow to get gmail.send permission + refresh token."""
+    request.session["oauth_return_to"] = return_to
+    url = get_gmail_auth_url(request)
+    return RedirectResponse(url)
 
 
 @app.post("/auth/logout")
@@ -143,8 +158,13 @@ async def health():
 # ── API routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/me")
-async def api_me(user: dict = Depends(require_auth)):
-    return user
+async def api_me(request: Request, user: dict = Depends(require_auth)):
+    # Enrich with live gmail status from DB
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User).where(User.email == user["email"]))
+        db_user = result.scalar_one_or_none()
+    gmail_connected = bool(db_user and db_user.gmail_refresh_token)
+    return {**user, "gmail_connected": gmail_connected}
 
 
 @app.get("/api/sf-accounts")
@@ -306,6 +326,90 @@ async def api_scan_logs(scan_id: str, user: dict = Depends(require_auth)):
         "status": run.status,
         "audit_log": run.audit_log_json or [],
     }
+
+
+# ── Contacts + Email Send ─────────────────────────────────────────────────────
+
+@app.get("/api/scans/{scan_id}/contacts")
+async def api_scan_contacts(scan_id: str, user: dict = Depends(require_auth)):
+    """Return SF contacts for the brand being scanned."""
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ScanRun, scan_id)
+    if not run:
+        raise HTTPException(404, "Scan not found")
+    contacts = get_contacts_for_brand(run.brand_name, run.domain)
+    return {"brand_name": run.brand_name, "domain": run.domain, "contacts": contacts}
+
+
+class SendEmailRequest(BaseModel):
+    contacts: List[dict]          # [{email, first_name, last_name, title}]
+    subject: str
+    body: str                     # may contain {{first_name}} placeholder
+
+
+@app.post("/api/scans/{scan_id}/send-emails")
+async def api_send_emails(
+    scan_id: str,
+    payload: SendEmailRequest,
+    user: dict = Depends(require_auth),
+):
+    """Send personalised Slinger emails via Gmail to selected contacts."""
+    # Look up the user's Gmail refresh token
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User).where(User.email == user["email"]))
+        db_user = result.scalar_one_or_none()
+
+    if not db_user or not db_user.gmail_refresh_token:
+        raise HTTPException(403, "Gmail not connected — visit /auth/gmail to connect")
+
+    run = None
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ScanRun, scan_id)
+    if not run:
+        raise HTTPException(404, "Scan not found")
+
+    results = []
+    for contact in payload.contacts:
+        to_email = contact.get("email", "")
+        first_name = contact.get("first_name", "").strip() or contact.get("last_name", "").strip() or "there"
+        if not to_email:
+            continue
+
+        # Personalise body — replace {{first_name}} placeholder
+        personalised_body = payload.body.replace("{{first_name}}", first_name)
+
+        send_result = await gmail_send(
+            refresh_token=db_user.gmail_refresh_token,
+            to_email=to_email,
+            subject=payload.subject,
+            body=personalised_body,
+        )
+
+        # Log to DB
+        async with AsyncSessionLocal() as db:
+            log_row = EmailSend(
+                scan_id=run.id,
+                sent_by=user["email"],
+                to_email=to_email,
+                to_name=f"{contact.get('first_name','')} {contact.get('last_name','')}".strip(),
+                subject=payload.subject,
+                body=personalised_body,
+                gmail_message_id=send_result.get("message_id"),
+                status="sent" if send_result["ok"] else "failed",
+                error=send_result.get("error"),
+            )
+            db.add(log_row)
+            await db.commit()
+
+        results.append({
+            "email": to_email,
+            "name": f"{contact.get('first_name','')} {contact.get('last_name','')}".strip(),
+            **send_result,
+        })
+
+    sent = sum(1 for r in results if r["ok"])
+    failed = len(results) - sent
+    return {"sent": sent, "failed": failed, "results": results}
 
 
 @app.get("/api/scans/{scan_id}/chrome-status")
